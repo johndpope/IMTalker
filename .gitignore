@@ -1,0 +1,5 @@
+
+/checkpoints
+/__pycache__
+/generator/__pycache__
+/renderer/__pycache__
