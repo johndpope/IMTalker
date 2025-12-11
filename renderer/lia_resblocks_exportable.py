@@ -480,6 +480,18 @@ def convert_equal_linear(module: nn.Module) -> nn.Module:
     if isinstance(module, EqualLinear):
         return ExportableEqualLinear.from_original(module)
 
+    # Handle nn.ModuleList specially
+    if isinstance(module, nn.ModuleList):
+        for i, child in enumerate(module):
+            module[i] = convert_equal_linear(child)
+        return module
+
+    # Handle nn.Sequential
+    if isinstance(module, nn.Sequential):
+        for i, child in enumerate(module):
+            module[i] = convert_equal_linear(child)
+        return module
+
     for name, child in module.named_children():
         setattr(module, name, convert_equal_linear(child))
 
@@ -493,6 +505,18 @@ def convert_equal_conv(module: nn.Module) -> nn.Module:
     if isinstance(module, EqualConv2d):
         return ExportableEqualConv2d.from_original(module)
 
+    # Handle nn.ModuleList specially
+    if isinstance(module, nn.ModuleList):
+        for i, child in enumerate(module):
+            module[i] = convert_equal_conv(child)
+        return module
+
+    # Handle nn.Sequential
+    if isinstance(module, nn.Sequential):
+        for i, child in enumerate(module):
+            module[i] = convert_equal_conv(child)
+        return module
+
     for name, child in module.named_children():
         setattr(module, name, convert_equal_conv(child))
 
@@ -505,6 +529,18 @@ def convert_styled_conv(module: nn.Module) -> nn.Module:
 
     if isinstance(module, StyledConv):
         return ExportableStyledConv.from_original(module)
+
+    # Handle nn.ModuleList specially
+    if isinstance(module, nn.ModuleList):
+        for i, child in enumerate(module):
+            module[i] = convert_styled_conv(child)
+        return module
+
+    # Handle nn.Sequential
+    if isinstance(module, nn.Sequential):
+        for i, child in enumerate(module):
+            module[i] = convert_styled_conv(child)
+        return module
 
     for name, child in module.named_children():
         setattr(module, name, convert_styled_conv(child))

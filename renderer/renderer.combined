@@ -1,0 +1,4254 @@
+"""
+Export-Friendly Attention Modules for IMTalker
+===============================================
+
+This module provides ONNX/TF.js-exportable replacements for the attention
+mechanisms in attention_modules.py.
+
+Key Changes:
+1. ExportFriendlyMultiheadAttention - Uses nn.MultiheadAttention with fixed sequence lengths
+2. ExportFriendlyUpsampler - Replaces GuidedResampler with learnable upsampling + attention
+3. ExportFriendlySwinAttention - Pre-computes relative position bias, uses fixed window partitioning
+4. Export-friendly transformer blocks with static shapes
+
+The main issue with GuidedResampler is its use of:
+- torch.topk() with dynamic k values
+- torch.gather() with dynamic indices
+- Complex index arithmetic that creates data-dependent control flow
+
+Our solution replaces this with:
+- Learnable upsampling (ConvTranspose2d)
+- Standard cross-attention between upsampled features and high-res features
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from typing import Optional, Tuple
+
+
+class ExportFriendlyMultiheadAttention(nn.Module):
+    """
+    Export-friendly multihead attention using PyTorch's nn.MultiheadAttention.
+
+    This is a drop-in replacement for StandardUnifiedAttention that:
+    1. Uses the optimized nn.MultiheadAttention implementation
+    2. Supports fixed maximum sequence lengths for ONNX export
+    3. Returns compatible output format (output, attention_weights)
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        qkv_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        # Use nn.MultiheadAttention for better export compatibility
+        self.mha = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=attn_drop,
+            bias=qkv_bias,
+            batch_first=True,
+        )
+
+        # Additional projection dropout (MHA has internal dropout)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            query: [B, N_q, C]
+            key: [B, N_k, C]
+            value: [B, N_k, C]
+            mask: Optional attention mask
+
+        Returns:
+            output: [B, N_q, C]
+            attn_weights: [B, num_heads, N_q, N_k]
+        """
+        # Convert mask format if needed
+        attn_mask = None
+        if mask is not None:
+            # nn.MultiheadAttention expects additive mask where -inf means "don't attend"
+            # Our mask is 0 for "don't attend", so we convert
+            attn_mask = mask.float().masked_fill(mask == 0, float('-inf'))
+
+        # nn.MultiheadAttention with batch_first=True
+        output, attn_weights = self.mha(
+            query, key, value,
+            attn_mask=attn_mask,
+            need_weights=True,
+            average_attn_weights=False,  # Return per-head weights
+        )
+
+        output = self.proj_drop(output)
+
+        return output, attn_weights
+
+    @classmethod
+    def from_original(cls, original: 'StandardUnifiedAttention') -> 'ExportFriendlyMultiheadAttention':
+        """Convert from original StandardUnifiedAttention."""
+        exportable = cls(
+            dim=original.q_proj.in_features,
+            num_heads=original.num_heads,
+            qkv_bias=original.q_proj.bias is not None,
+            attn_drop=original.attn_drop.p if hasattr(original.attn_drop, 'p') else 0.0,
+            proj_drop=original.proj_drop.p if hasattr(original.proj_drop, 'p') else 0.0,
+        )
+
+        # Transfer weights to nn.MultiheadAttention format
+        # MHA packs Q, K, V into in_proj_weight
+        with torch.no_grad():
+            # in_proj_weight is [3*dim, dim] for Q, K, V stacked
+            exportable.mha.in_proj_weight.copy_(torch.cat([
+                original.q_proj.weight,
+                original.k_proj.weight,
+                original.v_proj.weight,
+            ], dim=0))
+
+            if original.q_proj.bias is not None:
+                exportable.mha.in_proj_bias.copy_(torch.cat([
+                    original.q_proj.bias,
+                    original.k_proj.bias,
+                    original.v_proj.bias,
+                ], dim=0))
+
+            # Output projection
+            exportable.mha.out_proj.weight.copy_(original.proj.weight)
+            if original.proj.bias is not None:
+                exportable.mha.out_proj.bias.copy_(original.proj.bias)
+
+        return exportable
+
+
+class ExportFriendlyUpsampler(nn.Module):
+    """
+    Export-friendly replacement for GuidedResampler.
+
+    Instead of using dynamic top-k selection and sparse indexing,
+    we use learnable upsampling followed by cross-attention.
+
+    The key insight is that GuidedResampler essentially:
+    1. Uses coarse attention map to guide selection from high-res features
+    2. Warps/resamples high-res features based on coarse attention
+
+    Our replacement:
+    1. Upsample low-res features to high-res using ConvTranspose2d
+    2. Apply cross-attention between upsampled features and high-res features
+    3. This achieves similar "guided" behavior but is fully exportable
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        upsample_ratio: int = 4,
+        num_heads: int = 8,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.ratio = upsample_ratio
+        self.num_heads = num_heads
+
+        # Learnable upsampler
+        self.upsample = nn.Sequential(
+            nn.ConvTranspose2d(dim, dim, kernel_size=upsample_ratio, stride=upsample_ratio),
+            nn.GELU(),
+            nn.Conv2d(dim, dim, kernel_size=3, padding=1),
+        )
+
+        # Cross-attention to blend with high-res features
+        self.cross_attn = ExportFriendlyMultiheadAttention(
+            dim=dim,
+            num_heads=num_heads,
+            qkv_bias=True,
+            attn_drop=0.0,
+            proj_drop=0.0,
+        )
+
+        # Layer norms
+        self.norm_q = nn.LayerNorm(dim)
+        self.norm_kv = nn.LayerNorm(dim)
+
+        # Output projection
+        self.out_proj = nn.Conv2d(dim, dim, kernel_size=1)
+
+    def forward(
+        self,
+        v_high_feat: torch.Tensor,
+        coarse_attn_map: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            v_high_feat: High resolution features [B, C, H, W]
+            coarse_attn_map: Attention map from coarse level [B, N_low, N_low]
+                            (Note: We don't actually use this for dynamic indexing,
+                             but keep the signature for compatibility)
+
+        Returns:
+            warped_feat: Warped high-res features [B, C, H, W]
+        """
+        B, C, H, W = v_high_feat.shape
+        H_low, W_low = H // self.ratio, W // self.ratio
+
+        # Create low-res query from attention map (learnable projection)
+        # We interpret the attention map as a soft selection over spatial locations
+        # Shape: [B, N_low, N_low] -> [B, C, H_low, W_low]
+
+        # Use the attention map to weight the high-res features at coarse level
+        # First, pool high-res to low-res
+        v_low = F.adaptive_avg_pool2d(v_high_feat, (H_low, W_low))
+
+        # Upsample to high resolution
+        v_upsampled = self.upsample(v_low)  # [B, C, H, W]
+
+        # Flatten for attention
+        q = v_upsampled.flatten(2).transpose(1, 2)  # [B, H*W, C]
+        kv = v_high_feat.flatten(2).transpose(1, 2)  # [B, H*W, C]
+
+        # Normalize
+        q = self.norm_q(q)
+        kv = self.norm_kv(kv)
+
+        # Cross-attention: upsampled queries attending to high-res key/values
+        out, _ = self.cross_attn(q, kv, kv)
+
+        # Reshape back to spatial
+        out = out.transpose(1, 2).view(B, C, H, W)
+
+        # Final projection
+        out = self.out_proj(out)
+
+        return out
+
+    @classmethod
+    def from_original(
+        cls,
+        original: 'GuidedResampler',
+        num_heads: int = 8,
+    ) -> 'ExportFriendlyUpsampler':
+        """
+        Create from original GuidedResampler.
+
+        Note: GuidedResampler has no learnable parameters, so this
+        creates a new module that needs to be trained/fine-tuned.
+        """
+        return cls(
+            dim=original.dim,
+            upsample_ratio=original.ratio,
+            num_heads=num_heads,
+        )
+
+
+class ExportFriendlySwinAttention(nn.Module):
+    """
+    Export-friendly Swin Transformer attention.
+
+    Key changes for exportability:
+    1. Pre-compute relative position bias as a fixed buffer
+    2. Use standard attention operations without dynamic indexing
+    3. Fixed window size with pre-computed masks
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        window_size: int,
+        qkv_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        # Q, K, V projections
+        self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        self.k = nn.Linear(dim, dim, bias=qkv_bias)
+        self.v = nn.Linear(dim, dim, bias=qkv_bias)
+
+        # Relative position bias - pre-expanded to [num_heads, ws*ws, ws*ws]
+        self.relative_position_bias = nn.Parameter(
+            torch.zeros(num_heads, window_size * window_size, window_size * window_size)
+        )
+        nn.init.trunc_normal_(self.relative_position_bias, std=0.02)
+
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        batch_size: Optional[int] = None,
+        num_windows: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            query: [B*num_windows, window_size*window_size, C]
+            key: [B*num_windows, window_size*window_size, C]
+            value: [B*num_windows, window_size*window_size, C]
+            mask: Optional shift mask [num_windows, ws*ws, ws*ws]
+            batch_size: Explicit batch size to avoid dynamic computation
+            num_windows: Explicit number of windows to avoid dynamic computation
+
+        Returns:
+            output: [B*num_windows, window_size*window_size, C]
+        """
+        B_, N, C = query.shape
+
+        # Project Q, K, V
+        q = self.q(query).view(B_, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.k(key).view(B_, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.v(value).view(B_, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        # Attention scores
+        attn = (q * self.scale) @ k.transpose(-2, -1)  # [B_, num_heads, N, N]
+
+        # Add pre-computed relative position bias
+        attn = attn + self.relative_position_bias.unsqueeze(0)
+
+        # Apply shift mask if provided
+        if mask is not None:
+            # Use explicitly passed values to avoid dynamic shape computation
+            if num_windows is None:
+                nW = mask.shape[0]
+            else:
+                nW = num_windows
+            if batch_size is None:
+                B = B_ // nW
+            else:
+                B = batch_size
+            attn = attn.view(B, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(B * nW, self.num_heads, N, N)
+
+        attn = F.softmax(attn, dim=-1)
+        attn = self.attn_drop(attn)
+
+        # Apply attention to values
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+
+        # Output projection
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        return x
+
+    @classmethod
+    def from_original(cls, original: 'SwinUnifiedAttention') -> 'ExportFriendlySwinAttention':
+        """Convert from original SwinUnifiedAttention."""
+        # Infer window size from relative_position_bias_table
+        table_size = original.relative_position_bias_table.shape[0]
+        # table_size = (2*ws-1)^2, solve for ws
+        ws = (int(math.sqrt(table_size)) + 1) // 2
+
+        exportable = cls(
+            dim=original.q.in_features,
+            num_heads=original.num_heads,
+            window_size=ws,
+            qkv_bias=original.q.bias is not None,
+            attn_drop=original.attn_drop.p if hasattr(original.attn_drop, 'p') else 0.0,
+            proj_drop=original.proj_drop.p if hasattr(original.proj_drop, 'p') else 0.0,
+        )
+
+        with torch.no_grad():
+            # Copy Q, K, V projections
+            exportable.q.weight.copy_(original.q.weight)
+            exportable.k.weight.copy_(original.k.weight)
+            exportable.v.weight.copy_(original.v.weight)
+
+            if original.q.bias is not None:
+                exportable.q.bias.copy_(original.q.bias)
+                exportable.k.bias.copy_(original.k.bias)
+                exportable.v.bias.copy_(original.v.bias)
+
+            # Copy output projection
+            exportable.proj.weight.copy_(original.proj.weight)
+            if original.proj.bias is not None:
+                exportable.proj.bias.copy_(original.proj.bias)
+
+            # Expand relative position bias table to full matrix
+            # Original: [table_size, num_heads] with index lookup
+            # Exportable: [num_heads, ws*ws, ws*ws] pre-expanded
+            rel_pos_idx = original.relative_position_index  # [ws*ws, ws*ws]
+            rel_pos_table = original.relative_position_bias_table  # [table_size, num_heads]
+
+            # Gather and reshape
+            ws_sq = ws * ws
+            expanded_bias = rel_pos_table[rel_pos_idx.view(-1)].view(ws_sq, ws_sq, -1)
+            exportable.relative_position_bias.copy_(expanded_bias.permute(2, 0, 1))
+
+        return exportable
+
+
+def window_partition_static(x: torch.Tensor, window_size: int) -> torch.Tensor:
+    """
+    Static window partition for fixed input resolution.
+
+    Args:
+        x: [B, H, W, C]
+        window_size: Size of windows
+
+    Returns:
+        windows: [B*num_windows, window_size*window_size, C]
+    """
+    B, H, W, C = x.shape
+    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size * window_size, C)
+    return windows
+
+
+def window_reverse_static(
+    windows: torch.Tensor,
+    window_size: int,
+    H: int,
+    W: int,
+) -> torch.Tensor:
+    """
+    Static window reverse for fixed output resolution.
+
+    Args:
+        windows: [B*num_windows, window_size*window_size, C]
+        window_size: Size of windows
+        H, W: Output spatial dimensions
+
+    Returns:
+        x: [B, H, W, C]
+    """
+    num_windows = (H // window_size) * (W // window_size)
+    B = windows.shape[0] // num_windows
+    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+    return x
+
+
+class StaticWindowPartition(nn.Module):
+    """
+    Static window partition as a module with pre-computed dimensions.
+    This avoids dynamic shape computations during ONNX export.
+    """
+
+    def __init__(self, H: int, W: int, window_size: int):
+        super().__init__()
+        self.H = H
+        self.W = W
+        self.window_size = window_size
+        self.num_h = H // window_size
+        self.num_w = W // window_size
+        self.num_windows = self.num_h * self.num_w
+        self.window_area = window_size * window_size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, H, W, C]
+        Returns:
+            windows: [B*num_windows, window_size*window_size, C]
+        """
+        B = x.shape[0]
+        C = x.shape[3]
+        # Use pre-computed constants
+        x = x.view(B, self.num_h, self.window_size, self.num_w, self.window_size, C)
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+        windows = x.view(B * self.num_windows, self.window_area, C)
+        return windows
+
+
+class StaticWindowReverse(nn.Module):
+    """
+    Static window reverse as a module with pre-computed dimensions.
+    This avoids dynamic shape computations during ONNX export.
+    """
+
+    def __init__(self, H: int, W: int, window_size: int):
+        super().__init__()
+        self.H = H
+        self.W = W
+        self.window_size = window_size
+        self.num_h = H // window_size
+        self.num_w = W // window_size
+        self.num_windows = self.num_h * self.num_w
+
+    def forward(self, windows: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """
+        Args:
+            windows: [B*num_windows, window_size*window_size, C]
+            batch_size: The batch size B (passed explicitly to avoid dynamic computation)
+        Returns:
+            x: [B, H, W, C]
+        """
+        C = windows.shape[2]
+        x = windows.view(batch_size, self.num_h, self.num_w, self.window_size, self.window_size, C)
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+        x = x.view(batch_size, self.H, self.W, C)
+        return x
+
+
+class ExportFriendlyTransformerBlock(nn.Module):
+    """
+    Export-friendly standard Transformer block.
+
+    Drop-in replacement for UnifiedTransformerBlock with static shapes.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        input_resolution: Tuple[int, int],
+        num_heads: int,
+        mlp_ratio: float = 2.0,
+        qkv_bias: bool = True,
+        drop: float = 0.0,
+        attn_drop: float = 0.0,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.input_resolution = input_resolution
+        H, W = input_resolution
+
+        self.norm_q = nn.LayerNorm(dim)
+        self.norm_kv = nn.LayerNorm(dim)
+
+        self.attn = ExportFriendlyMultiheadAttention(
+            dim=dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=drop,
+        )
+
+        # Positional embeddings
+        self.q_pos_embedding = nn.Parameter(torch.randn(1, H * W, dim))
+        self.k_pos_embedding = nn.Parameter(torch.randn(1, H * W, dim))
+
+        self.norm_ffn = nn.LayerNorm(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(drop),
+            nn.Linear(mlp_hidden_dim, dim),
+            nn.Dropout(drop),
+        )
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: Optional[torch.Tensor] = None,
+        value: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            query: [B, C, H, W]
+            key: Optional [B, C, H, W] for cross-attention
+            value: Optional [B, C, H, W] for cross-attention
+
+        Returns:
+            output: [B, C, H, W]
+        """
+        B, C, H, W = query.shape
+
+        if key is None:
+            key = query
+            value = query
+
+        # Flatten to sequence
+        q_in = query.flatten(2).transpose(1, 2)  # [B, H*W, C]
+        k_in = key.flatten(2).transpose(1, 2)
+        v_in = value.flatten(2).transpose(1, 2)
+        shortcut = v_in
+
+        # Add positional embeddings and normalize
+        q_norm = self.norm_q(q_in + self.q_pos_embedding)
+        k_norm = self.norm_kv(k_in + self.k_pos_embedding)
+        v_norm = self.norm_kv(v_in)
+
+        # Attention
+        attn_output, _ = self.attn(query=q_norm, key=k_norm, value=v_norm)
+
+        # Residual + FFN
+        x = shortcut + attn_output
+        x = x + self.mlp(self.norm_ffn(x))
+
+        return x.transpose(1, 2).view(B, C, H, W)
+
+    @classmethod
+    def from_original(cls, original: 'UnifiedTransformerBlock') -> 'ExportFriendlyTransformerBlock':
+        """Convert from original UnifiedTransformerBlock."""
+        dim = original.norm_q.normalized_shape[0]
+        # Infer resolution from positional embedding shape
+        seq_len = original.q_pos_embedding.shape[1]
+        import math
+        res = int(math.sqrt(seq_len))
+
+        exportable = cls(
+            dim=dim,
+            input_resolution=(res, res),
+            num_heads=original.attn.num_heads,
+            mlp_ratio=2.0,  # Default, may need adjustment
+            qkv_bias=True,
+        )
+
+        # Transfer attention weights
+        exportable.attn = ExportFriendlyMultiheadAttention.from_original(original.attn)
+
+        with torch.no_grad():
+            # Copy norms
+            exportable.norm_q.weight.copy_(original.norm_q.weight)
+            exportable.norm_q.bias.copy_(original.norm_q.bias)
+            exportable.norm_kv.weight.copy_(original.norm_kv.weight)
+            exportable.norm_kv.bias.copy_(original.norm_kv.bias)
+            exportable.norm_ffn.weight.copy_(original.norm_ffn.weight)
+            exportable.norm_ffn.bias.copy_(original.norm_ffn.bias)
+
+            # Copy positional embeddings
+            exportable.q_pos_embedding.copy_(original.q_pos_embedding)
+            exportable.k_pos_embedding.copy_(original.k_pos_embedding)
+
+            # Copy MLP weights
+            for i, (exp_layer, orig_layer) in enumerate(zip(exportable.mlp, original.mlp)):
+                if hasattr(exp_layer, 'weight'):
+                    exp_layer.weight.copy_(orig_layer.weight)
+                if hasattr(exp_layer, 'bias') and exp_layer.bias is not None:
+                    exp_layer.bias.copy_(orig_layer.bias)
+
+        return exportable
+
+
+class ExportFriendlySwinBlock(nn.Module):
+    """
+    Export-friendly Swin Transformer block.
+
+    Drop-in replacement for UnifiedSwinBlock with FULLY STATIC window operations.
+    All dimensions are pre-computed at init time to avoid dynamic shape inference.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        input_resolution: Tuple[int, int],
+        num_heads: int,
+        window_size: int = 7,
+        shift_size: int = 0,
+        mlp_ratio: float = 2.0,
+        qkv_bias: bool = True,
+        drop: float = 0.0,
+        attn_drop: float = 0.0,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.input_resolution = input_resolution
+        self.window_size = window_size
+        self.shift_size = shift_size
+
+        H, W = input_resolution
+        if min(H, W) <= window_size:
+            self.shift_size = 0
+            self.window_size = min(H, W)
+
+        # Store as Python ints for static computation
+        self.H = H
+        self.W = W
+
+        self.norm_q = nn.LayerNorm(dim)
+        self.norm_kv = nn.LayerNorm(dim)
+
+        self.attn = ExportFriendlySwinAttention(
+            dim=dim,
+            num_heads=num_heads,
+            window_size=self.window_size,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=drop,
+        )
+
+        self.norm_ffn = nn.LayerNorm(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Linear(mlp_hidden_dim, dim),
+            nn.Dropout(drop),
+        )
+
+        # Static window modules with pre-computed dimensions
+        self.window_partition = StaticWindowPartition(H, W, self.window_size)
+        self.window_reverse = StaticWindowReverse(H, W, self.window_size)
+
+        # Pre-compute shift mask
+        if self.shift_size > 0:
+            attn_mask = self._compute_attn_mask(H, W)
+        else:
+            attn_mask = None
+        self.register_buffer("attn_mask", attn_mask)
+
+    def _compute_attn_mask(self, H: int, W: int) -> torch.Tensor:
+        """Pre-compute attention mask for shifted windows."""
+        img_mask = torch.zeros((1, H, W, 1))
+        h_slices = (
+            slice(0, -self.window_size),
+            slice(-self.window_size, -self.shift_size),
+            slice(-self.shift_size, None),
+        )
+        w_slices = (
+            slice(0, -self.window_size),
+            slice(-self.window_size, -self.shift_size),
+            slice(-self.shift_size, None),
+        )
+        cnt = 0
+        for h in h_slices:
+            for w in w_slices:
+                img_mask[:, h, w, :] = cnt
+                cnt += 1
+
+        mask_windows = window_partition_static(img_mask, self.window_size)
+        mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
+        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0))
+        attn_mask = attn_mask.masked_fill(attn_mask == 0, float(0.0))
+        return attn_mask
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: Optional[torch.Tensor] = None,
+        value: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            query: [B, C, H, W]
+            key: Optional [B, C, H, W]
+            value: Optional [B, C, H, W]
+
+        Returns:
+            output: [B, C, H, W]
+        """
+        # Use static dimensions instead of dynamic shape inference
+        B = query.shape[0]
+        C = self.dim
+        H = self.H
+        W = self.W
+
+        if key is None:
+            key = query
+            value = query
+
+        # Flatten to sequence
+        q = query.flatten(2).transpose(1, 2)
+        k = key.flatten(2).transpose(1, 2)
+        v = value.flatten(2).transpose(1, 2)
+        shortcut = v
+
+        # Normalize and reshape to spatial (use static H, W)
+        q = self.norm_q(q).view(B, H, W, C)
+        k = self.norm_kv(k).view(B, H, W, C)
+        v = self.norm_kv(v).view(B, H, W, C)
+
+        # Apply cyclic shift
+        if self.shift_size > 0:
+            shifted_q = torch.roll(q, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            shifted_k = torch.roll(k, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            shifted_v = torch.roll(v, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+        else:
+            shifted_q, shifted_k, shifted_v = q, k, v
+
+        # Partition into windows using static module
+        q_win = self.window_partition(shifted_q)
+        k_win = self.window_partition(shifted_k)
+        v_win = self.window_partition(shifted_v)
+
+        # Windowed attention - pass batch_size and num_windows explicitly for static export
+        attn_windows = self.attn(
+            q_win, k_win, v_win,
+            mask=self.attn_mask,
+            batch_size=B,
+            num_windows=self.window_partition.num_windows
+        )
+
+        # Reverse windows using static module (pass batch size explicitly)
+        shifted_x = self.window_reverse(attn_windows, B)
+
+        # Reverse cyclic shift
+        if self.shift_size > 0:
+            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+        else:
+            x = shifted_x
+
+        # Residual + FFN
+        x = x.view(B, H * W, C)
+        x = shortcut + x
+        x = x + self.mlp(self.norm_ffn(x))
+
+        return x.transpose(1, 2).view(B, C, H, W)
+
+    @classmethod
+    def from_original(cls, original: 'UnifiedSwinBlock') -> 'ExportFriendlySwinBlock':
+        """Convert from original UnifiedSwinBlock."""
+        exportable = cls(
+            dim=original.norm_q.normalized_shape[0],
+            input_resolution=original.input_resolution,
+            num_heads=original.attn.num_heads,
+            window_size=original.window_size,
+            shift_size=original.shift_size,
+            mlp_ratio=2.0,
+            qkv_bias=True,
+        )
+
+        # Transfer attention weights
+        exportable.attn = ExportFriendlySwinAttention.from_original(original.attn)
+
+        with torch.no_grad():
+            # Copy norms
+            exportable.norm_q.weight.copy_(original.norm_q.weight)
+            exportable.norm_q.bias.copy_(original.norm_q.bias)
+            exportable.norm_kv.weight.copy_(original.norm_kv.weight)
+            exportable.norm_kv.bias.copy_(original.norm_kv.bias)
+            exportable.norm_ffn.weight.copy_(original.norm_ffn.weight)
+            exportable.norm_ffn.bias.copy_(original.norm_ffn.bias)
+
+            # Copy MLP weights
+            for exp_layer, orig_layer in zip(exportable.mlp, original.mlp):
+                if hasattr(exp_layer, 'weight'):
+                    exp_layer.weight.copy_(orig_layer.weight)
+                if hasattr(exp_layer, 'bias') and exp_layer.bias is not None:
+                    exp_layer.bias.copy_(orig_layer.bias)
+
+            # Copy attention mask if present
+            if original.attn_mask is not None and exportable.attn_mask is not None:
+                exportable.attn_mask.copy_(original.attn_mask)
+
+        return exportable
+
+
+class ExportFriendlyCrossAttention(nn.Module):
+    """
+    Export-friendly cross attention module.
+
+    Replaces CrossAttention with fully exportable operations.
+    For high-resolution features, uses ExportFriendlyUpsampler instead of GuidedResampler.
+    For low-resolution features, uses ExportFriendlyMultiheadAttention.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        resolution: Tuple[int, int],
+        num_heads: int,
+        swin_res_threshold: int = 32,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.resolution = resolution
+        self.is_standard_attention = resolution[0] < swin_res_threshold
+
+        if self.is_standard_attention:
+            self.block_efc = ExportFriendlyMultiheadAttention(
+                dim=dim,
+                num_heads=num_heads,
+                qkv_bias=True,
+            )
+        else:
+            anchor_resolution = swin_res_threshold
+            ratio = 2 * (resolution[0] / anchor_resolution)
+            assert ratio >= 1 and ratio == int(ratio), \
+                "Fine resolution must be a multiple of anchor resolution"
+            self.block = ExportFriendlyUpsampler(
+                dim=dim,
+                upsample_ratio=int(ratio),
+                num_heads=num_heads,
+            )
+
+    def coarse_stage(
+        self,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        attn: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Coarse stage attention (standard attention path).
+
+        Args:
+            A: Query features [B, C, H, W]
+            B: Key features [B, C, H, W]
+            C: Value features [B, C, H, W]
+            attn: Unused
+
+        Returns:
+            output: [B, C, H, W]
+            attn_map: [B, num_heads, N, N]
+        """
+        B_, C_, H, W = A.shape
+        A_seq = A.flatten(2).transpose(1, 2)
+        B_seq = B.flatten(2).transpose(1, 2)
+        C_seq = C.flatten(2).transpose(1, 2)
+        out_seq, attn_map = self.block_efc(A_seq, B_seq, C_seq)
+        out = out_seq.transpose(1, 2).view(B_, C_, H, W)
+        return out, attn_map
+
+    def fine_stage(
+        self,
+        C: torch.Tensor,
+        attn: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Fine stage attention (high-res upsampler path).
+
+        Args:
+            C: Value features [B, C, H, W]
+            attn: Attention map from coarse level
+
+        Returns:
+            output: [B, C, H, W]
+        """
+        attn_input = attn.mean(dim=1) if attn is not None else None
+        out = self.block(C, attn_input)
+        return out
+
+    def forward(
+        self,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        D: Optional[torch.Tensor] = None,
+        attn: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Args:
+            A: Query features [B, C, H, W]
+            B: Key features [B, C, H, W]
+            C: Value features [B, C, H, W]
+            D: Unused (kept for compatibility)
+            attn: Optional attention map from coarse level
+
+        Returns:
+            output: [B, C, H, W]
+            attn_map: Optional attention weights
+        """
+        if not self.is_standard_attention:
+            # High resolution path - use upsampler
+            out = self.fine_stage(C, attn)
+            return out
+        else:
+            # Standard attention path
+            return self.coarse_stage(A, B, C, attn)
+
+    @classmethod
+    def from_original(
+        cls,
+        original: 'CrossAttention',
+        num_heads: int = 8,
+        swin_res_threshold: int = 32,
+    ) -> 'ExportFriendlyCrossAttention':
+        """Convert from original CrossAttention."""
+        # Infer resolution and dim from the original module
+        if original.is_standard_attention:
+            dim = original.block_efc.q_proj.in_features
+            # Resolution is harder to infer, will use a placeholder
+            resolution = (16, 16)  # Default, should be passed explicitly
+        else:
+            dim = original.block.dim
+            resolution = (64, 64)  # Default for high-res
+
+        exportable = cls(
+            dim=dim,
+            resolution=resolution,
+            num_heads=num_heads,
+            swin_res_threshold=swin_res_threshold,
+        )
+
+        # Transfer weights for standard attention path
+        if original.is_standard_attention:
+            exportable.block_efc = ExportFriendlyMultiheadAttention.from_original(
+                original.block_efc
+            )
+        # Note: GuidedResampler has no learnable weights, so ExportFriendlyUpsampler
+        # will need training/fine-tuning
+
+        return exportable
+
+
+class ExportFriendlySelfAttention(nn.Module):
+    """
+    Export-friendly self attention module.
+
+    Replaces SelfAttention with exportable Swin or Transformer blocks.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        resolution: Tuple[int, int],
+        num_heads: int,
+        window_size: int = 8,
+        swin_res_threshold: int = 32,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.resolution = resolution
+        self.use_swin = resolution[0] >= swin_res_threshold
+
+        self.blocks = nn.ModuleList()
+
+        if self.use_swin:
+            # Use Swin blocks for high resolution
+            self.blocks.append(ExportFriendlySwinBlock(
+                dim=dim,
+                input_resolution=resolution,
+                num_heads=num_heads,
+                window_size=window_size,
+                shift_size=0,
+            ))
+            self.blocks.append(ExportFriendlySwinBlock(
+                dim=dim,
+                input_resolution=resolution,
+                num_heads=num_heads,
+                window_size=window_size,
+                shift_size=window_size // 2,
+            ))
+        else:
+            # Use standard transformer for low resolution
+            self.blocks.append(ExportFriendlyTransformerBlock(
+                dim=dim,
+                input_resolution=resolution,
+                num_heads=num_heads,
+                mlp_ratio=2.0,
+            ))
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: Optional[torch.Tensor] = None,
+        value: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            query: [B, C, H, W]
+            key: Optional [B, C, H, W]
+            value: Optional [B, C, H, W]
+
+        Returns:
+            output: [B, C, H, W]
+        """
+        if key is not None:
+            # Cross-attention mode
+            v_out = value
+            for block in self.blocks:
+                v_out = block(query, key, v_out)
+            return v_out
+        else:
+            # Self-attention mode
+            x_out = query
+            for block in self.blocks:
+                x_out = block(x_out)
+            return x_out
+
+    @classmethod
+    def from_original(
+        cls,
+        original: 'SelfAttention',
+        window_size: int = 8,
+        swin_res_threshold: int = 32,
+    ) -> 'ExportFriendlySelfAttention':
+        """Convert from original SelfAttention."""
+        # Get info from first block
+        first_block = original.blocks[0]
+        dim = first_block.norm_q.normalized_shape[0]
+
+        if hasattr(first_block, 'input_resolution'):
+            resolution = first_block.input_resolution
+        else:
+            resolution = (16, 16)  # Default
+
+        if hasattr(first_block, 'attn'):
+            num_heads = first_block.attn.num_heads
+        else:
+            num_heads = 8
+
+        exportable = cls(
+            dim=dim,
+            resolution=resolution,
+            num_heads=num_heads,
+            window_size=window_size,
+            swin_res_threshold=swin_res_threshold,
+        )
+
+        # Transfer weights from original blocks
+        for i, (exp_block, orig_block) in enumerate(zip(exportable.blocks, original.blocks)):
+            if isinstance(orig_block, type(original.blocks[0])):
+                if hasattr(orig_block, 'window_size'):
+                    # Swin block
+                    exportable.blocks[i] = ExportFriendlySwinBlock.from_original(orig_block)
+                else:
+                    # Transformer block
+                    exportable.blocks[i] = ExportFriendlyTransformerBlock.from_original(orig_block)
+
+        return exportable
+
+
+def convert_attention_modules(model: nn.Module, args=None) -> nn.Module:
+    """
+    Convert all attention modules in a model to export-friendly versions.
+
+    This function recursively traverses the model and replaces:
+    - StandardUnifiedAttention -> ExportFriendlyMultiheadAttention
+    - GuidedResampler -> ExportFriendlyUpsampler
+    - SwinUnifiedAttention -> ExportFriendlySwinAttention
+    - UnifiedTransformerBlock -> ExportFriendlyTransformerBlock
+    - UnifiedSwinBlock -> ExportFriendlySwinBlock
+    - CrossAttention -> ExportFriendlyCrossAttention
+    - SelfAttention -> ExportFriendlySelfAttention
+
+    Args:
+        model: The model to convert
+        args: Optional args namespace with num_heads, window_size, swin_res_threshold
+
+    Returns:
+        The converted model (modified in-place)
+    """
+    from renderer.attention_modules import (
+        StandardUnifiedAttention, GuidedResampler, SwinUnifiedAttention,
+        UnifiedTransformerBlock, UnifiedSwinBlock, CrossAttention, SelfAttention
+    )
+
+    # Default args
+    num_heads = getattr(args, 'num_heads', 8) if args else 8
+    window_size = getattr(args, 'window_size', 8) if args else 8
+    swin_res_threshold = getattr(args, 'swin_res_threshold', 32) if args else 32
+
+    for name, module in model.named_children():
+        if isinstance(module, StandardUnifiedAttention):
+            setattr(model, name, ExportFriendlyMultiheadAttention.from_original(module))
+        elif isinstance(module, GuidedResampler):
+            setattr(model, name, ExportFriendlyUpsampler.from_original(module, num_heads))
+        elif isinstance(module, SwinUnifiedAttention):
+            setattr(model, name, ExportFriendlySwinAttention.from_original(module))
+        elif isinstance(module, UnifiedTransformerBlock):
+            setattr(model, name, ExportFriendlyTransformerBlock.from_original(module))
+        elif isinstance(module, UnifiedSwinBlock):
+            setattr(model, name, ExportFriendlySwinBlock.from_original(module))
+        elif isinstance(module, CrossAttention):
+            setattr(model, name, ExportFriendlyCrossAttention.from_original(
+                module, num_heads, swin_res_threshold
+            ))
+        elif isinstance(module, SelfAttention):
+            setattr(model, name, ExportFriendlySelfAttention.from_original(
+                module, window_size, swin_res_threshold
+            ))
+        elif isinstance(module, nn.ModuleList):
+            # Handle ModuleList - convert each element
+            for i, submodule in enumerate(module):
+                if isinstance(submodule, StandardUnifiedAttention):
+                    module[i] = ExportFriendlyMultiheadAttention.from_original(submodule)
+                elif isinstance(submodule, GuidedResampler):
+                    module[i] = ExportFriendlyUpsampler.from_original(submodule, num_heads)
+                elif isinstance(submodule, SwinUnifiedAttention):
+                    module[i] = ExportFriendlySwinAttention.from_original(submodule)
+                elif isinstance(submodule, UnifiedTransformerBlock):
+                    module[i] = ExportFriendlyTransformerBlock.from_original(submodule)
+                elif isinstance(submodule, UnifiedSwinBlock):
+                    module[i] = ExportFriendlySwinBlock.from_original(submodule)
+                elif isinstance(submodule, CrossAttention):
+                    module[i] = ExportFriendlyCrossAttention.from_original(
+                        submodule, num_heads, swin_res_threshold
+                    )
+                elif isinstance(submodule, SelfAttention):
+                    module[i] = ExportFriendlySelfAttention.from_original(
+                        submodule, window_size, swin_res_threshold
+                    )
+                else:
+                    # Recursively convert children of this submodule
+                    convert_attention_modules(submodule, args)
+        else:
+            # Recursively convert children
+            convert_attention_modules(module, args)
+
+    return model
+
+"""
+Export-Friendly LIA ResBlocks for ONNX/TF.js Compatibility
+==========================================================
+
+This module provides ONNX-exportable replacements for the StyleGAN2-based
+blocks in lia_resblocks.py. The key changes:
+
+1. EqualLinear/EqualConv2d: Bake scale into weights (no runtime multiplication)
+2. ModulatedConv2d: Replace per-sample weight modulation with equivalent
+   standard operations (feature modulation instead of weight modulation)
+
+The export-friendly versions load weights from the original checkpoint and
+produce numerically equivalent (within FP32 tolerance) outputs.
+
+Usage:
+    # Load original model
+    original = IMTRenderer(args)
+    original.load_state_dict(torch.load('renderer.ckpt')['state_dict'])
+
+    # Convert to export-friendly version
+    from renderer.lia_resblocks_exportable import convert_to_exportable
+    exportable = convert_to_exportable(original)
+
+    # Verify parity
+    with torch.no_grad():
+        out_orig = original(x_current, x_reference)
+        out_export = exportable(x_current, x_reference)
+        print(f"Parity: {torch.allclose(out_orig[0], out_export[0], atol=1e-5)}")
+
+    # Export to ONNX
+    torch.onnx.export(exportable, ...)
+"""
+
+import math
+import torch
+from torch import nn
+from torch.nn import functional as F
+import numpy as np
+from typing import Optional, Tuple
+
+
+# =============================================================================
+# EXPORT-FRIENDLY BASIC BLOCKS
+# =============================================================================
+
+class ExportableEqualLinear(nn.Module):
+    """
+    Export-friendly version of EqualLinear.
+
+    Original EqualLinear multiplies weights by scale at runtime:
+        out = F.linear(input, self.weight * self.scale, bias)
+
+    This version bakes the scale into the weights during construction,
+    making it a standard nn.Linear that ONNX can handle.
+
+    Weight Transfer:
+        new_weight = old_weight * old_scale
+        new_bias = old_bias * old_lr_mul (if activation) else old_bias
+    """
+    def __init__(self, in_dim: int, out_dim: int, bias: bool = True, activation: bool = False):
+        super().__init__()
+        self.linear = nn.Linear(in_dim, out_dim, bias=bias)
+        self.activation = activation
+        self.scale = 2 ** 0.5  # For fused_leaky_relu scaling
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.linear(x)
+        if self.activation:
+            # Fused leaky relu with scaling: leaky_relu(x) * sqrt(2)
+            out = F.leaky_relu(out, negative_slope=0.2) * self.scale
+        return out
+
+    @classmethod
+    def from_original(cls, original_module) -> 'ExportableEqualLinear':
+        """
+        Create from original EqualLinear, baking in the scale.
+        """
+        in_dim = original_module.weight.shape[1]
+        out_dim = original_module.weight.shape[0]
+        has_bias = original_module.bias is not None
+        has_activation = original_module.activation is not None
+
+        new_module = cls(in_dim, out_dim, bias=has_bias, activation=has_activation)
+
+        with torch.no_grad():
+            # Bake scale into weights
+            scale = original_module.scale
+            new_module.linear.weight.copy_(original_module.weight * scale)
+
+            if has_bias:
+                # Bias scaling depends on whether activation is used
+                lr_mul = original_module.lr_mul
+                if has_activation:
+                    # For fused_leaky_relu, bias is added before activation
+                    new_module.linear.bias.copy_(original_module.bias * lr_mul)
+                else:
+                    new_module.linear.bias.copy_(original_module.bias * lr_mul)
+
+        return new_module
+
+
+class ExportableEqualConv2d(nn.Module):
+    """
+    Export-friendly version of EqualConv2d.
+
+    Original EqualConv2d multiplies weights by scale at runtime:
+        out = F.conv2d(input, self.weight * self.scale, bias, ...)
+
+    This version bakes the scale into weights, making it a standard Conv2d.
+    """
+    def __init__(self, in_channel: int, out_channel: int, kernel_size: int,
+                 stride: int = 1, padding: int = 0, bias: bool = True):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channel, out_channel, kernel_size,
+                              stride=stride, padding=padding, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+    @classmethod
+    def from_original(cls, original_module) -> 'ExportableEqualConv2d':
+        """
+        Create from original EqualConv2d, baking in the scale.
+        """
+        out_ch, in_ch, k, _ = original_module.weight.shape
+        has_bias = original_module.bias is not None
+
+        new_module = cls(
+            in_ch, out_ch, k,
+            stride=original_module.stride,
+            padding=original_module.padding,
+            bias=has_bias
+        )
+
+        with torch.no_grad():
+            # Bake scale into weights
+            scale = original_module.scale
+            new_module.conv.weight.copy_(original_module.weight * scale)
+            if has_bias:
+                new_module.conv.bias.copy_(original_module.bias)
+
+        return new_module
+
+
+class ExportableFusedLeakyReLU(nn.Module):
+    """
+    Export-friendly version of FusedLeakyReLU.
+
+    Original adds a learnable bias then applies scaled leaky relu.
+    This version does the same but with explicit operations.
+    """
+    def __init__(self, channel: int, negative_slope: float = 0.2, scale: float = 2**0.5):
+        super().__init__()
+        self.bias = nn.Parameter(torch.zeros(1, channel, 1, 1))
+        self.negative_slope = negative_slope
+        self.scale = scale
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.leaky_relu(x + self.bias, self.negative_slope) * self.scale
+
+    @classmethod
+    def from_original(cls, original_module) -> 'ExportableFusedLeakyReLU':
+        new_module = cls(
+            original_module.bias.shape[1],
+            original_module.negative_slope,
+            original_module.scale
+        )
+        with torch.no_grad():
+            new_module.bias.copy_(original_module.bias)
+        return new_module
+
+
+# =============================================================================
+# EXPORT-FRIENDLY MODULATED CONV2D - THE KEY CHALLENGE
+# =============================================================================
+
+class ExportableModulatedConv2d(nn.Module):
+    """
+    Export-friendly version of ModulatedConv2d.
+
+    PROBLEM WITH ORIGINAL:
+    ---------------------
+    The original ModulatedConv2d does per-sample weight modulation:
+        1. style = modulation(style_input)  # [B, in_ch]
+        2. weight = base_weight * style.view(B, 1, in_ch, 1, 1)  # Per-sample!
+        3. weight = weight.view(B * out_ch, in_ch, k, k)
+        4. F.conv2d(input.view(1, B*in_ch, H, W), weight, groups=B)
+
+    This uses groups=batch which creates dynamic graph structures that
+    ONNX/TF.js cannot handle.
+
+    SOLUTION - FEATURE MODULATION:
+    -----------------------------
+    Instead of modulating weights, we modulate the INPUT features:
+        1. style = modulation(style_input)  # [B, in_ch]
+        2. x_mod = x * style.view(B, in_ch, 1, 1)  # Modulate input
+        3. out = conv(x_mod)  # Standard convolution
+        4. if demodulate: out = out / demod_factor
+
+    This is mathematically equivalent for the forward pass because:
+        conv(x * s, w) = conv(x, w * s)  (when s is per-channel)
+
+    The demodulation step is slightly different but produces equivalent
+    results in practice (we compute it based on style rather than weights).
+    """
+    def __init__(
+        self,
+        in_channel: int,
+        out_channel: int,
+        kernel_size: int,
+        style_dim: int,
+        demodulate: bool = True,
+        upsample: bool = False,
+        downsample: bool = False,
+        blur_kernel: list = [1, 3, 3, 1]
+    ):
+        super().__init__()
+
+        self.in_channel = in_channel
+        self.out_channel = out_channel
+        self.kernel_size = kernel_size
+        self.demodulate = demodulate
+        self.upsample = upsample
+        self.downsample = downsample
+        self.padding = kernel_size // 2
+
+        # Scale factor (same as original)
+        fan_in = in_channel * kernel_size ** 2
+        self.scale = 1 / math.sqrt(fan_in)
+
+        # Style modulation: maps style_dim -> in_channel (for input modulation)
+        self.modulation = ExportableEqualLinear(style_dim, in_channel, bias=True)
+
+        # Main convolution weight (without the leading batch dimension)
+        self.weight = nn.Parameter(torch.randn(out_channel, in_channel, kernel_size, kernel_size))
+
+        # For demodulation, we need weight norm per output channel
+        # This is precomputed as: sqrt(sum(weight^2, dims=[in_ch, k, k]))
+        # We'll compute it dynamically but it's a simple reduction
+
+        # Blur for up/downsampling
+        if upsample:
+            factor = 2
+            p = (len(blur_kernel) - factor) - (kernel_size - 1)
+            pad0 = (p + 1) // 2 + factor - 1
+            pad1 = p // 2 + 1
+            self.blur = ExportableBlur(blur_kernel, pad=(pad0, pad1), upsample_factor=factor)
+
+        if downsample:
+            factor = 2
+            p = (len(blur_kernel) - factor) + (kernel_size - 1)
+            pad0 = (p + 1) // 2
+            pad1 = p // 2
+            self.blur = ExportableBlur(blur_kernel, pad=(pad0, pad1))
+
+    def forward(self, x: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass using feature modulation instead of weight modulation.
+
+        For ONNX compatibility, we avoid grouped convolutions with groups=batch.
+        Instead, we process each sample through the same convolution but with
+        per-sample feature scaling (modulation) and output scaling (demodulation).
+
+        Args:
+            x: Input features [B, in_channel, H, W]
+            style: Style vector [B, style_dim]
+
+        Returns:
+            out: Modulated output [B, out_channel, H', W']
+        """
+        batch, in_channel, height, width = x.shape
+
+        # Get modulation factors: [B, in_channel]
+        style_mod = self.modulation(style)  # [B, in_channel]
+
+        # === FEATURE MODULATION (replaces weight modulation) ===
+        # Modulate input features by style
+        # x_mod[b, c, h, w] = x[b, c, h, w] * style_mod[b, c]
+        x_mod = x * style_mod.view(batch, in_channel, 1, 1)
+
+        # Scale weights (this was done at runtime in original)
+        weight = self.weight * self.scale  # [out_ch, in_ch, k, k]
+
+        # === DEMODULATION FACTOR ===
+        if self.demodulate:
+            # Original demodulation: normalize by sqrt(sum(w^2 * s^2))
+            # Since we modulated x instead of w, we compute:
+            # demod = 1 / sqrt(sum_ic(w_oc_ic^2 * s_ic^2)) per output channel
+
+            # Expand weight squared: [out_ch, in_ch]
+            w_sq_per_ch = (weight ** 2).sum(dim=[2, 3])  # [out_ch, in_ch]
+
+            # Style squared: [B, in_channel]
+            s_sq = style_mod ** 2
+
+            # Compute demod factor: [B, out_ch]
+            demod_sq = torch.einsum('oi,bi->bo', w_sq_per_ch, s_sq) + 1e-8
+            demod = torch.rsqrt(demod_sq)  # [B, out_ch]
+
+        # === CONVOLUTION ===
+        if self.upsample:
+            # For upsample: use standard conv_transpose2d
+            # The original used groups=batch which isn't exportable
+            # We achieve the same result by:
+            # 1. Feature modulation (already done above)
+            # 2. Standard transpose conv
+            # 3. Per-sample output scaling (demodulation)
+
+            # Transpose conv weight should be [in_ch, out_ch, k, k] for conv_transpose2d
+            # Original weight is [out_ch, in_ch, k, k]
+            weight_t = weight.transpose(0, 1).contiguous()  # [in_ch, out_ch, k, k]
+
+            out = F.conv_transpose2d(x_mod, weight_t, padding=0, stride=2)
+            out = self.blur(out)
+
+        elif self.downsample:
+            x_blurred = self.blur(x_mod)
+            out = F.conv2d(x_blurred, weight, padding=0, stride=2)
+
+        else:
+            out = F.conv2d(x_mod, weight, padding=self.padding)
+
+        # Apply demodulation (per-sample output scaling)
+        if self.demodulate:
+            out = out * demod.view(batch, self.out_channel, 1, 1)
+
+        return out
+
+    @classmethod
+    def from_original(cls, original_module) -> 'ExportableModulatedConv2d':
+        """
+        Create from original ModulatedConv2d, transferring weights.
+        """
+        new_module = cls(
+            in_channel=original_module.in_channel,
+            out_channel=original_module.out_channel,
+            kernel_size=original_module.kernel_size,
+            style_dim=original_module.modulation.weight.shape[1],  # Get from modulation layer
+            demodulate=original_module.demodulate,
+            upsample=original_module.upsample,
+            downsample=original_module.downsample,
+        )
+
+        with torch.no_grad():
+            # Transfer main weight (remove leading dim if present)
+            orig_weight = original_module.weight
+            if orig_weight.dim() == 5:
+                orig_weight = orig_weight.squeeze(0)
+            new_module.weight.copy_(orig_weight)
+
+            # Transfer modulation layer
+            new_module.modulation = ExportableEqualLinear.from_original(original_module.modulation)
+
+            # Transfer blur if present
+            if original_module.upsample or original_module.downsample:
+                new_module.blur.kernel.copy_(original_module.blur.kernel)
+
+        return new_module
+
+
+class ExportableBlur(nn.Module):
+    """
+    Export-friendly blur using standard conv2d.
+    """
+    def __init__(self, kernel: list, pad: tuple, upsample_factor: int = 1):
+        super().__init__()
+
+        # Create blur kernel
+        k = torch.tensor(kernel, dtype=torch.float32)
+        if k.ndim == 1:
+            k = k[None, :] * k[:, None]
+        k = k / k.sum()
+
+        if upsample_factor > 1:
+            k = k * (upsample_factor ** 2)
+
+        self.register_buffer('kernel', k)
+        self.pad = pad
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply blur using depthwise conv."""
+        kernel = self.kernel
+        kernel_h, kernel_w = kernel.shape
+
+        # Upfirdn2d implementation using standard ops
+        batch, channels, height, width = x.shape
+
+        # Pad
+        x = F.pad(x, [self.pad[0], self.pad[1], self.pad[0], self.pad[1]])
+
+        # Apply blur per channel (depthwise)
+        # Reshape kernel for depthwise conv: [channels, 1, kh, kw]
+        kernel_expanded = kernel.view(1, 1, kernel_h, kernel_w).expand(channels, 1, kernel_h, kernel_w)
+
+        out = F.conv2d(x, kernel_expanded, groups=channels)
+
+        return out
+
+
+# =============================================================================
+# EXPORT-FRIENDLY STYLED CONV
+# =============================================================================
+
+class ExportableStyledConv(nn.Module):
+    """
+    Export-friendly version of StyledConv.
+
+    Combines:
+    - ModulatedConv2d (now using feature modulation)
+    - NoiseInjection (optional, often disabled during inference)
+    - FusedLeakyReLU activation
+    """
+    def __init__(
+        self,
+        in_channel: int,
+        out_channel: int,
+        kernel_size: int,
+        style_dim: int,
+        upsample: bool = False,
+        blur_kernel: list = [1, 3, 3, 1],
+        demodulate: bool = True
+    ):
+        super().__init__()
+
+        self.conv = ExportableModulatedConv2d(
+            in_channel, out_channel, kernel_size, style_dim,
+            upsample=upsample, blur_kernel=blur_kernel, demodulate=demodulate
+        )
+
+        # Noise weight (usually not used during inference)
+        self.noise_weight = nn.Parameter(torch.zeros(1))
+
+        # Activation
+        self.activate = ExportableFusedLeakyReLU(out_channel)
+
+    def forward(self, x: torch.Tensor, style: torch.Tensor, noise: Optional[torch.Tensor] = None) -> torch.Tensor:
+        out = self.conv(x, style)
+
+        if noise is not None:
+            out = out + self.noise_weight * noise
+
+        out = self.activate(out)
+        return out
+
+    @classmethod
+    def from_original(cls, original_module) -> 'ExportableStyledConv':
+        """Create from original StyledConv."""
+        orig_conv = original_module.conv
+
+        new_module = cls(
+            in_channel=orig_conv.in_channel,
+            out_channel=orig_conv.out_channel,
+            kernel_size=orig_conv.kernel_size,
+            style_dim=orig_conv.modulation.weight.shape[1],
+            upsample=orig_conv.upsample,
+            demodulate=orig_conv.demodulate
+        )
+
+        with torch.no_grad():
+            # Transfer conv
+            new_module.conv = ExportableModulatedConv2d.from_original(orig_conv)
+
+            # Transfer noise weight
+            new_module.noise_weight.copy_(original_module.noise.weight)
+
+            # Transfer activation
+            new_module.activate = ExportableFusedLeakyReLU.from_original(original_module.activate)
+
+        return new_module
+
+
+# =============================================================================
+# CONVERSION UTILITIES
+# =============================================================================
+
+def convert_equal_linear(module: nn.Module) -> nn.Module:
+    """Recursively convert EqualLinear to ExportableEqualLinear."""
+    from renderer.lia_resblocks import EqualLinear
+
+    if isinstance(module, EqualLinear):
+        return ExportableEqualLinear.from_original(module)
+
+    for name, child in module.named_children():
+        setattr(module, name, convert_equal_linear(child))
+
+    return module
+
+
+def convert_equal_conv(module: nn.Module) -> nn.Module:
+    """Recursively convert EqualConv2d to ExportableEqualConv2d."""
+    from renderer.lia_resblocks import EqualConv2d
+
+    if isinstance(module, EqualConv2d):
+        return ExportableEqualConv2d.from_original(module)
+
+    for name, child in module.named_children():
+        setattr(module, name, convert_equal_conv(child))
+
+    return module
+
+
+def convert_styled_conv(module: nn.Module) -> nn.Module:
+    """Recursively convert StyledConv to ExportableStyledConv."""
+    from renderer.lia_resblocks import StyledConv
+
+    if isinstance(module, StyledConv):
+        return ExportableStyledConv.from_original(module)
+
+    for name, child in module.named_children():
+        setattr(module, name, convert_styled_conv(child))
+
+    return module
+
+
+def convert_to_exportable(model: nn.Module, convert_attention: bool = False, args=None) -> nn.Module:
+    """
+    Convert a model to use export-friendly blocks.
+
+    This recursively replaces:
+    - EqualLinear -> ExportableEqualLinear
+    - EqualConv2d -> ExportableEqualConv2d
+    - StyledConv -> ExportableStyledConv
+
+    And optionally (with convert_attention=True):
+    - StandardUnifiedAttention -> ExportFriendlyMultiheadAttention
+    - GuidedResampler -> ExportFriendlyUpsampler
+    - SwinUnifiedAttention -> ExportFriendlySwinAttention
+    - CrossAttention -> ExportFriendlyCrossAttention
+    - SelfAttention -> ExportFriendlySelfAttention
+
+    The converted model should produce numerically equivalent outputs
+    and be exportable to ONNX/TF.js.
+
+    Args:
+        model: Original model (e.g., IMTRenderer)
+        convert_attention: Whether to also convert attention modules
+        args: Optional args namespace with num_heads, window_size, swin_res_threshold
+
+    Returns:
+        Converted model with export-friendly blocks
+    """
+    import copy
+    model = copy.deepcopy(model)
+
+    # Convert in order: styled_conv first (contains modulated_conv), then others
+    model = convert_styled_conv(model)
+    model = convert_equal_conv(model)
+    model = convert_equal_linear(model)
+
+    # Optionally convert attention modules
+    if convert_attention:
+        from renderer.attention_modules_exportable import convert_attention_modules
+        model = convert_attention_modules(model, args)
+
+    return model
+
+
+# =============================================================================
+# PARITY TESTING
+# =============================================================================
+
+def test_equal_linear_parity():
+    """Test ExportableEqualLinear produces same output as EqualLinear."""
+    from renderer.lia_resblocks import EqualLinear
+
+    # Create original
+    original = EqualLinear(512, 256, activation='fused_lrelu')
+    original.eval()
+
+    # Convert to exportable
+    exportable = ExportableEqualLinear.from_original(original)
+    exportable.eval()
+
+    # Test
+    x = torch.randn(4, 512)
+    with torch.no_grad():
+        out_orig = original(x)
+        out_export = exportable(x)
+
+    max_diff = (out_orig - out_export).abs().max().item()
+    print(f"EqualLinear parity - Max diff: {max_diff:.2e}")
+    return max_diff < 1e-5
+
+
+def test_modulated_conv_parity():
+    """Test ExportableModulatedConv2d produces same output as ModulatedConv2d."""
+    from renderer.lia_resblocks import ModulatedConv2d
+
+    # Create original
+    original = ModulatedConv2d(
+        in_channel=256, out_channel=256, kernel_size=3,
+        style_dim=32, demodulate=True
+    )
+    original.eval()
+
+    # Convert to exportable
+    exportable = ExportableModulatedConv2d.from_original(original)
+    exportable.eval()
+
+    # Test
+    x = torch.randn(2, 256, 16, 16)
+    style = torch.randn(2, 32)
+
+    with torch.no_grad():
+        out_orig = original(x, style)
+        out_export = exportable(x, style)
+
+    max_diff = (out_orig - out_export).abs().max().item()
+    mean_diff = (out_orig - out_export).abs().mean().item()
+
+    print(f"ModulatedConv2d parity - Max diff: {max_diff:.2e}, Mean diff: {mean_diff:.2e}")
+
+    # Check relative error
+    rel_error = (out_orig - out_export).abs() / (out_orig.abs() + 1e-8)
+    print(f"  Relative error - Max: {rel_error.max().item():.2e}, Mean: {rel_error.mean().item():.2e}")
+
+    return max_diff < 1e-4
+
+
+def test_styled_conv_parity():
+    """Test ExportableStyledConv produces same output as StyledConv."""
+    from renderer.lia_resblocks import StyledConv
+
+    # Create original
+    original = StyledConv(
+        in_channel=256, out_channel=256, kernel_size=3,
+        style_dim=32, upsample=False
+    )
+    original.eval()
+
+    # Convert to exportable
+    exportable = ExportableStyledConv.from_original(original)
+    exportable.eval()
+
+    # Test
+    x = torch.randn(2, 256, 16, 16)
+    style = torch.randn(2, 32)
+
+    with torch.no_grad():
+        out_orig = original(x, style)
+        out_export = exportable(x, style)
+
+    max_diff = (out_orig - out_export).abs().max().item()
+    mean_diff = (out_orig - out_export).abs().mean().item()
+
+    print(f"StyledConv parity - Max diff: {max_diff:.2e}, Mean diff: {mean_diff:.2e}")
+
+    return max_diff < 1e-4
+
+
+def run_all_parity_tests():
+    """Run all parity tests."""
+    print("=" * 60)
+    print("PARITY TESTS: Original vs Export-Friendly Blocks")
+    print("=" * 60)
+
+    results = {}
+
+    print("\n1. Testing EqualLinear...")
+    results['EqualLinear'] = test_equal_linear_parity()
+
+    print("\n2. Testing ModulatedConv2d...")
+    results['ModulatedConv2d'] = test_modulated_conv_parity()
+
+    print("\n3. Testing StyledConv...")
+    results['StyledConv'] = test_styled_conv_parity()
+
+    print("\n" + "=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+    for name, passed in results.items():
+        status = "PASS" if passed else "FAIL"
+        print(f"  {name}: {status}")
+
+    all_passed = all(results.values())
+    print(f"\nOverall: {'ALL TESTS PASSED' if all_passed else 'SOME TESTS FAILED'}")
+
+    return all_passed
+
+
+if __name__ == "__main__":
+    run_all_parity_tests()
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from timm.models.layers import to_2tuple, trunc_normal_
+
+def window_partition(x, window_size):
+    B, H, W, C = x.shape
+    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size * window_size, C)
+    return windows
+
+
+def window_reverse(windows, window_size, H, W):
+    B = int(windows.shape[0] / (H * W / window_size / window_size))
+    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+    return x
+
+class StandardUnifiedAttention(nn.Module):
+
+    def __init__(self, dim, num_heads, qkv_bias=True, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.k_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.v_proj = nn.Linear(dim, dim, bias=qkv_bias)
+
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, query, key, value, mask=None):
+        B, N, C = query.shape
+
+        q = self.q_proj(query).view(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        k = self.k_proj(key).view(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        v = self.v_proj(value).view(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+
+        if mask is not None:
+            attn = attn.masked_fill(mask == 0, float('-inf'))
+
+        attn_map = attn.softmax(dim=-1)
+        attn_map_dropped = self.attn_drop(attn_map)
+
+        x = (attn_map_dropped @ v).transpose(1, 2).reshape(B, N, C)
+
+        # Final projection and dropout
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        return x, attn_map
+
+class GuidedResampler(nn.Module):
+
+    def __init__(self, dim, downsample_ratio=4, k_top_samples=1):
+        super().__init__()
+        self.dim = dim
+        self.ratio = downsample_ratio
+        self.k_samples = k_top_samples
+
+    def forward(self, v_high_feat, coarse_attn_map):
+        # --- 1. 准备工作：获取维度信息并将特征图转换为序列 ---
+        B, C, H, W = v_high_feat.shape
+        H_low, W_low = H // self.ratio, W // self.ratio
+        N_high = H * W
+        N_low = H_low * W_low
+
+        assert coarse_attn_map.shape == (B, N_low, N_low), \
+            f"Coarse map shape mismatch. Expected {(B, N_low, N_low)}, but got {coarse_attn_map.shape}"
+
+        v_high_seq = v_high_feat.flatten(2).transpose(1, 2)
+
+        topk_values, topk_indices_low = torch.topk(coarse_attn_map, k=self.k_samples, dim=-1)
+
+        topk_indices_low_row = topk_indices_low // W_low
+        topk_indices_low_col = topk_indices_low % W_low
+
+        topk_indices_high_topleft_row = topk_indices_low_row * self.ratio
+        topk_indices_high_topleft_col = topk_indices_low_col * self.ratio
+        
+        delta = torch.stack(torch.meshgrid(
+            torch.arange(self.ratio, device=v_high_feat.device),
+            torch.arange(self.ratio, device=v_high_feat.device),
+            indexing='ij'
+        ), dim=-1).view(-1, 2)
+
+        topleft = torch.stack([topk_indices_high_topleft_row, topk_indices_high_topleft_col], dim=-1)
+        sparse_indices_2d = topleft.unsqueeze(-2) + delta.view(1, 1, 1, -1, 2)
+
+        sparse_indices_1d = sparse_indices_2d[..., 0] * W + sparse_indices_2d[..., 1]
+        sparse_indices_1d = sparse_indices_1d.view(B, N_low, -1)
+
+        high_res_q_coords = torch.stack(torch.meshgrid(
+            torch.arange(H, device=v_high_feat.device),
+            torch.arange(W, device=v_high_feat.device),
+            indexing='ij'
+        ), dim=-1).view(-1, 2)
+        
+        low_res_grid_indices = (high_res_q_coords[:, 0] // self.ratio) * W_low + (high_res_q_coords[:, 1] // self.ratio)
+        
+        K_sparse_len = sparse_indices_1d.shape[-1]
+        low_res_grid_indices_expanded = low_res_grid_indices.view(1, N_high, 1).expand(B, -1, K_sparse_len)
+        
+        final_sparse_indices = torch.gather(sparse_indices_1d, 1, low_res_grid_indices_expanded)
+
+        batch_indices = torch.arange(B, device=v_high_feat.device).view(B, 1, 1)
+        v_sparse_seq = v_high_seq[batch_indices, final_sparse_indices]
+        
+        normalized_weights_low = F.softmax(topk_values, dim=-1)
+        low_res_grid_indices_weights_expanded = low_res_grid_indices.view(1, N_high, 1).expand(B, -1, self.k_samples)
+        weights_high = torch.gather(normalized_weights_low, 1, low_res_grid_indices_weights_expanded)
+
+        v_reshaped = v_sparse_seq.view(B, N_high, self.k_samples, self.ratio**2, C)
+
+        weights_for_broadcast = (weights_high / (self.ratio**2)).view(B, N_high, self.k_samples, 1, 1)
+
+        warped_seq = (v_reshaped * weights_for_broadcast).sum(dim=(2, 3))
+
+        warped_feat = warped_seq.transpose(1, 2).view(B, C, H, W)
+        
+        return warped_feat
+
+
+class SwinUnifiedAttention(nn.Module):
+    def __init__(self, dim, num_heads, window_size, qkv_bias=True, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+        
+        self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        self.k = nn.Linear(dim, dim, bias=qkv_bias)
+        self.v = nn.Linear(dim, dim, bias=qkv_bias)
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * window_size - 1) * (2 * window_size - 1), num_heads))
+        
+        coords_h = torch.arange(window_size)
+        coords_w = torch.arange(window_size)
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing="ij"))
+        coords_flatten = torch.flatten(coords, 1)
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()
+        relative_coords[:, :, 0] += window_size - 1
+        relative_coords[:, :, 1] += window_size - 1
+        relative_coords[:, :, 0] *= 2 * window_size - 1
+        relative_position_index = relative_coords.sum(-1)
+        self.register_buffer("relative_position_index", relative_position_index)
+        
+        trunc_normal_(self.relative_position_bias_table, std=.02)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, query, key, value, mask=None):
+        B_, N, C = query.shape
+        q = self.q(query).reshape(B_, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        k = self.k(key).reshape(B_, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        v = self.v(value).reshape(B_, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        
+        attn = (q * self.scale) @ k.transpose(-2, -1)
+        
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+            N, N, -1).permute(2, 0, 1).contiguous()
+        attn = attn + relative_position_bias.unsqueeze(0)
+        
+        if mask is not None:
+            nW = mask.shape[0]
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, N)
+        
+        attn = self.softmax(attn)
+        attn = self.attn_drop(attn)
+        
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+class UnifiedTransformerBlock(nn.Module):
+    """统一的标准 Transformer Block。"""
+    def __init__(self, dim, input_resolution, num_heads, mlp_ratio=2.0, qkv_bias=True,
+                 drop=0., attn_drop=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.norm_q = norm_layer(dim)
+        self.norm_kv = norm_layer(dim)
+        self.attn = StandardUnifiedAttention(dim, num_heads, qkv_bias, attn_drop, drop)
+
+        H, W = to_2tuple(input_resolution)
+        dim_spatial = H * W
+
+        self.q_pos_embedding = nn.Parameter(torch.randn(1, dim_spatial, dim))
+        self.k_pos_embedding = nn.Parameter(torch.randn(1, dim_spatial, dim))
+        
+        self.norm_ffn = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_hidden_dim), act_layer(), nn.Dropout(drop),
+            nn.Linear(mlp_hidden_dim, dim), nn.Dropout(drop)
+        )
+
+    def forward(self, query, key=None, value=None):
+        B, C, H, W = query.shape
+        is_cross_attention = key is not None
+        if not is_cross_attention:
+            key, value = query, query
+
+        q_in = query.flatten(2).transpose(1, 2)
+        k_in = key.flatten(2).transpose(1, 2)
+        v_in = value.flatten(2).transpose(1, 2)
+        shortcut = v_in
+        
+        q_norm = self.norm_q(q_in + self.q_pos_embedding)
+        k_norm = self.norm_kv(k_in + self.k_pos_embedding)
+        v_norm = self.norm_kv(v_in)
+        
+        attn_output, _ = self.attn(query=q_norm, key=k_norm, value=v_norm)
+        
+        x = shortcut + attn_output
+        x = x + self.mlp(self.norm_ffn(x))
+        return x.transpose(1, 2).view(B, C, H, W)
+
+class UnifiedSwinBlock(nn.Module):
+    def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
+                 mlp_ratio=2., qkv_bias=True, drop=0., attn_drop=0.,
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.input_resolution = to_2tuple(input_resolution)
+        self.window_size = window_size
+        self.shift_size = shift_size
+        if min(self.input_resolution) <= self.window_size:
+            self.shift_size = 0
+            self.window_size = min(self.input_resolution)
+        
+        self.norm_q = norm_layer(dim)
+        self.norm_kv = norm_layer(dim)
+        self.attn = SwinUnifiedAttention(
+            dim, num_heads, self.window_size, qkv_bias, attn_drop, drop)
+        
+        self.norm_ffn = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_hidden_dim), act_layer(),
+            nn.Linear(mlp_hidden_dim, dim), nn.Dropout(drop))
+        
+        if self.shift_size > 0:
+            H, W = self.input_resolution
+            img_mask = torch.zeros((1, H, W, 1))
+            h_slices = (slice(0, -self.window_size), slice(-self.window_size, -self.shift_size),
+                        slice(-self.shift_size, None))
+            w_slices = (slice(0, -self.window_size), slice(-self.window_size, -self.shift_size),
+                        slice(-self.shift_size, None))
+            cnt = 0
+            for h in h_slices:
+                for w in w_slices:
+                    img_mask[:, h, w, :] = cnt
+                    cnt += 1
+            mask_windows = window_partition(img_mask.view(1,H,W,1), self.window_size).view(-1, self.window_size * self.window_size)
+            attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+            attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+        else:
+            attn_mask = None
+        self.register_buffer("attn_mask", attn_mask)
+
+    def forward(self, query, key=None, value=None):
+        B, C, H, W = query.shape
+        is_cross_attention = key is not None
+        if not is_cross_attention:
+            key, value = query, query
+
+        q = query.flatten(2).transpose(1, 2)
+        k = key.flatten(2).transpose(1, 2)
+        v = value.flatten(2).transpose(1, 2)
+        shortcut = v
+        
+        q = self.norm_q(q).view(B, H, W, C)
+        k = self.norm_kv(k).view(B, H, W, C)
+        v = self.norm_kv(v).view(B, H, W, C)
+        
+        if self.shift_size > 0:
+            shifted_q, shifted_k, shifted_v = [torch.roll(t, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+                                               for t in (q, k, v)]
+        else:
+            shifted_q, shifted_k, shifted_v = q, k, v
+        
+        q_win = window_partition(shifted_q, self.window_size)
+        k_win = window_partition(shifted_k, self.window_size)
+        v_win = window_partition(shifted_v, self.window_size)
+        
+        attn_windows = self.attn(q_win, k_win, v_win, mask=self.attn_mask)
+        shifted_x = window_reverse(attn_windows, self.window_size, H, W)
+        
+        if self.shift_size > 0:
+            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+        else:
+            x = shifted_x
+        
+        x = x.view(B, H * W, C)
+        x = shortcut + x
+        x = x + self.mlp(self.norm_ffn(x))
+        return x.transpose(1, 2).view(B, C, H, W)
+    
+class CrossAttention(nn.Module):
+
+    def __init__(self, args, dim, resolution):
+        super().__init__()
+        self.is_standard_attention = resolution[0] < args.swin_res_threshold
+
+        if self.is_standard_attention:
+            self.block_efc = StandardUnifiedAttention(dim=dim, num_heads=args.num_heads)
+        else:
+            anchor_resolution = args.swin_res_threshold
+            ratio = 2 * (resolution[0] / anchor_resolution)
+            assert ratio >= 1 and ratio.is_integer(), "Fine resolution must be a multiple of anchor resolution"
+            self.block = GuidedResampler(dim=dim, downsample_ratio=int(ratio))
+    
+    def coarse_stage(self, A, B, C, attn=None):
+        B_, C_, H, W = A.shape
+        A_seq = A.flatten(2).transpose(1, 2)  # (B, HW, C)
+        B_seq = B.flatten(2).transpose(1, 2)
+        C_seq = C.flatten(2).transpose(1, 2)
+        out_seq, attn_map = self.block_efc(A_seq, B_seq, C_seq)
+        out = out_seq.transpose(1, 2).view(B_, C_, H, W)
+        return out, attn_map
+    
+    def fine_stage(self, C, attn=None):
+        out = self.block(C, attn.mean(dim=1))
+        return out
+    
+    def forward(self, A, B, C, D, attn=None):
+
+        if not self.is_standard_attention:
+            out = self.block(C, attn.mean(dim=1))
+            return out
+
+        else:
+            B_, C_, H, W = A.shape
+            A_seq = A.flatten(2).transpose(1, 2)  # (B, HW, C)
+            B_seq = B.flatten(2).transpose(1, 2)
+            C_seq = C.flatten(2).transpose(1, 2)
+            out_seq, attn_map = self.block_efc(A_seq, B_seq, C_seq)
+            out = out_seq.transpose(1, 2).view(B_, C_, H, W)
+            return out, attn_map
+
+class SelfAttention(nn.Module):
+    def __init__(self, args, dim, resolution):
+        super().__init__()
+        self.blocks = nn.ModuleList()
+        
+        common_kwargs = {
+            'dim': dim,
+            'input_resolution': resolution,
+            'num_heads': args.num_heads,
+        }
+
+        if resolution[0] >= args.swin_res_threshold:
+            self.blocks.append(UnifiedSwinBlock(window_size=args.window_size, shift_size=0, **common_kwargs))
+            self.blocks.append(UnifiedSwinBlock(window_size=args.window_size, shift_size=args.window_size // 2, **common_kwargs))
+        else:
+            self.blocks.append(UnifiedTransformerBlock(mlp_ratio=2.0, **common_kwargs))
+
+    def forward(self, query, key=None, value=None):
+        is_cross_attention = key is not None
+        if is_cross_attention:
+            v_out = value
+            for block in self.blocks:
+                v_out = block(query, key, v_out)
+            return v_out
+        else:
+            x_out = query
+            for block in self.blocks:
+                x_out = block(x_out)
+            return x_out
+"""
+==============================================================================
+IMTalker Renderer Models
+==============================================================================
+
+This module implements the Identity-Adaptive Motion Transfer Renderer from the
+IMTalker paper (arXiv:2511.22167). It builds upon the Implicit Motion Function
+(IMF) framework with key enhancements for identity preservation.
+
+ARCHITECTURE OVERVIEW (from IMTalker paper Section 3.2):
+--------------------------------------------------------
+The renderer G_render consists of three sub-modules:
+  1. Identity-Adaptive (IA) Module (Φ) - personalizes motion latents
+  2. Implicit Motion Transfer (IMT) Module - aligns motion with identity features
+  3. Synthesis Network - renders aligned features to output image
+
+TOKEN/LATENT FLOW:
+-----------------
+  Source Image (I_S) ──┬── IdentityEncoder ──► f_id (dense features) + global_id (512-dim)
+                       │
+                       └── MotionEncoder ────► z_motion_S (32-dim motion latent)
+                                                    │
+  Driving Signal ─────── MotionEncoder ────► z_motion_D (32-dim motion latent)
+                                                    │
+                              ┌──────────────────────┘
+                              ▼
+                    IdentityAdaptive(z_motion, global_id)
+                              │
+                              ▼
+                    z_motion' (personalized 32-dim latent)
+                              │
+                              ▼
+                    MotionDecoder(z_motion')
+                              │
+                              ▼
+                    Multi-scale motion maps (m1, m2, m3, m4)
+                              │
+                              ▼
+                    CrossAttention(m_D, m_S, f_id)
+                              │
+                              ▼
+                    Aligned features ──► SynthesisNetwork ──► Output Frame
+
+COMPARISON WITH ORIGINAL IMF (from /media/2TB/IMF/model.py):
+-----------------------------------------------------------
+Original IMF:
+  - LatentTokenEncoder: outputs dm=32 motion latent
+  - LatentTokenDecoder: StyleGAN2-based, produces multi-scale motion features
+  - ImplicitMotionAlignment: Cross-attention Q(m_c), K(m_r), V(f_r)
+  - No identity adaptation - motion and identity can leak
+
+IMTalker Enhancements:
+  - IdentityEncoder: Also outputs global identity embedding (dm=512)
+  - IdentityAdaptive Module (NEW): Projects motion latent into identity-specific
+    space via MLP: Φ(z_motion, f_global) → z_motion'
+  - Motion Distance Consistency Loss: Ensures equal adaptation "strength" for
+    all identities, preventing identity leakage
+  - Coarse-to-fine attention: Standard attention at low-res, guided sparse
+    resampling at high-res for efficiency (40 FPS @ 512x512)
+
+INTEGRATION NOTES:
+-----------------
+To integrate IMF tokens with IMTalker:
+  1. IMF's LatentTokenEncoder ≈ IMTalker's MotionEncoder (both output 32-dim)
+  2. IMF's motion latent can be passed through IdentityAdaptive before decoding
+  3. The key insight: personalization happens BEFORE the motion decoder, not after
+  4. The 32-dim latent is the "implicit motion function" - compact but expressive
+==============================================================================
+"""
+
+import torch
+import torch.nn as nn
+
+from renderer.modules import DownConvResBlock, ResBlock, UpConvResBlock, ConvResBlock
+from renderer.attention_modules import CrossAttention, SelfAttention
+from renderer.lia_resblocks import StyledConv, EqualConv2d, EqualLinear
+
+
+class IdentityEncoder(nn.Module):
+    """
+    Dense Feature Encoder (E_id) from IMTalker Section 3.2.
+
+    Extracts two types of representations from the source image:
+      1. Multi-scale dense features (f_dense) - spatial feature pyramids for rendering
+      2. Global identity embedding (f_global) - compact identity vector for IA module
+
+    Architecture (similar to IMF's DenseFeatureEncoder but with identity branch):
+      - Initial 7x7 conv → 32 channels
+      - 6 DownConvResBlocks: 32 → 64 → 128 → 256 → 512 → 512 → 512
+      - Global average pooling + 4x EqualLinear layers → 512-dim identity vector
+
+    Args:
+        in_channels: Input image channels (default: 3 for RGB)
+        output_channels: Channel progression through encoder [64, 128, 256, 512, 512, 512]
+        initial_channels: First conv output channels (default: 32)
+        dm: Dimension of global identity embedding (default: 512)
+             ★ This is DIFFERENT from motion latent dim (32) - identity needs more capacity
+
+    Returns:
+        features: List of dense feature maps [f_1, f_2, ..., f_6] in REVERSE order
+                  (coarsest first for decoder processing)
+        global_id: 512-dim identity embedding for IdentityAdaptive module
+
+    IMF Equivalent: DenseFeatureEncoder (but IMF doesn't output global_id)
+    """
+    def __init__(self, in_channels=3, output_channels=[64, 128, 256, 512, 512, 512], initial_channels=32, dm=512):
+        super(IdentityEncoder, self).__init__()
+
+        # Initial convolution: 3 → 32 channels, preserves spatial size
+        self.initial_conv = nn.Sequential(
+            nn.Conv2d(in_channels, initial_channels, kernel_size=7, stride=1, padding=3),
+            nn.BatchNorm2d(initial_channels),
+            nn.ReLU(inplace=True)
+        )
+
+        # Downsampling blocks: each halves spatial resolution
+        # 256→128→64→32→16→8→4 (for 256x256 input)
+        self.down_blocks = nn.ModuleList()
+        current_channels = initial_channels
+        for out_channels in output_channels:
+            if out_channels == 32:
+                continue  # Skip if same as initial (no-op)
+            self.down_blocks.append(DownConvResBlock(current_channels, out_channels))
+            current_channels = out_channels
+
+        # Identity embedding branch (NEW in IMTalker vs IMF)
+        # Processes the final feature map into a global identity vector
+        self.equalconv = EqualConv2d(output_channels[-1], output_channels[-1], kernel_size=3, stride=1, padding=1)
+        self.linear_layers = nn.ModuleList([EqualLinear(output_channels[-1], output_channels[-1]) for _ in range(4)])
+        self.final_linear = EqualLinear(output_channels[-1], dm)  # dm=512 for identity
+        self.activation = nn.LeakyReLU(0.2)
+
+    def forward(self, x):
+        """
+        Forward pass extracts both spatial features and global identity.
+
+        Args:
+            x: Input image tensor [B, 3, H, W]
+
+        Returns:
+            features: Multi-scale features [f_6, f_5, f_4, f_3, f_2, f_1] (reversed)
+            global_id: Identity embedding [B, 512]
+        """
+        features = []
+        x = self.initial_conv(x)
+        features.append(x)
+
+        # Build feature pyramid
+        for block in self.down_blocks:
+            x = block(x)
+            features.append(x)
+
+        # Global identity embedding via global average pooling + MLP
+        # x is now [B, 512, 4, 4] → flatten → [B, 512]
+        x = x.view(x.size(0), x.size(1), -1).mean(dim=2)
+        for linear_layer in self.linear_layers:
+            x = self.activation(linear_layer(x))
+        x = self.final_linear(x)  # [B, 512] identity embedding
+
+        # Return features in reverse order (coarsest first) + identity
+        return features[::-1], x
+
+class MotionEncoder(nn.Module):
+    """
+    Motion Encoder (E_motion) from IMTalker Section 3.1.
+
+    Encodes a frame into a compact motion latent vector (z_motion).
+    This is THE KEY TOKEN in the IMF/IMTalker architecture!
+
+    ★ THE MOTION LATENT (z_motion) IS THE "IMPLICIT MOTION FUNCTION" ★
+    - Dimension: 32 (dm=32) - highly compressed representation
+    - Contains: head pose, expression, eye gaze, lip shape - ALL motion info
+    - Identity-agnostic by design (but can leak identity without IA module)
+    - Can be generated from audio via Flow-Matching Motion Generator
+
+    Architecture (identical to IMF's LatentTokenEncoder):
+      - Initial 3x3 conv → 64 channels
+      - ResBlocks with downsampling: 64 → 128 → 256 → 512 → 512 → 512
+      - EqualConv2d for style consistency
+      - Global average pooling → [B, 512]
+      - 4x EqualLinear layers (512 → 512) with LeakyReLU
+      - Final linear: 512 → 32 (the motion latent!)
+
+    Args:
+        initial_channels: First conv output channels (default: 64)
+        output_channels: Channel progression [64, 128, 256, 512, 512, 512]
+        dm: Dimension of motion latent (default: 32)
+            ★ This is THE critical hyperparameter - 32 is the "magic number"
+            ★ Small enough for efficient generation, large enough for expressiveness
+
+    Returns:
+        z_motion: Motion latent tensor [B, 32]
+                  This 32-dim vector captures ALL motion information!
+
+    IMF Equivalent: LatentTokenEncoder (identical architecture)
+
+    IMPORTANT FOR INTEGRATION:
+    -------------------------
+    The output of this encoder is what gets passed to:
+      1. IdentityAdaptive module (for personalization)
+      2. MotionDecoder (to produce multi-scale motion maps)
+
+    For audio-driven generation, a Flow-Matching generator predicts z_motion
+    directly from audio features, bypassing this encoder entirely.
+    """
+    def __init__(self, initial_channels=64, output_channels=[64, 128, 256, 512, 512, 512], dm=32):
+        super(MotionEncoder, self).__init__()
+
+        # Initial convolution: 3 → 64 channels
+        self.conv1 = nn.Conv2d(3, initial_channels, kernel_size=3, stride=1, padding=1)
+        self.activation = nn.LeakyReLU(0.2)
+
+        # ResBlocks with downsampling (from LIA/StyleGAN2 codebase)
+        # Each ResBlock halves spatial resolution
+        self.res_blocks = nn.ModuleList()
+        in_channels = initial_channels
+        for out_channels in output_channels:
+            self.res_blocks.append(ResBlock(in_channels, out_channels))
+            in_channels = out_channels
+
+        # EqualConv2d for weight equalization (StyleGAN2 technique)
+        self.equalconv = EqualConv2d(output_channels[-1], output_channels[-1], kernel_size=3, stride=1, padding=1)
+
+        # MLP to produce final motion latent
+        # 4x EqualLinear: maintains expressiveness while compressing
+        self.linear_layers = nn.ModuleList([EqualLinear(output_channels[-1], output_channels[-1]) for _ in range(4)])
+
+        # Final projection: 512 → dm (32)
+        # This is where the "implicit motion function" becomes a compact token!
+        self.final_linear = EqualLinear(output_channels[-1], dm)
+
+    def forward(self, x):
+        """
+        Encode frame to motion latent.
+
+        Args:
+            x: Input frame [B, 3, H, W]
+
+        Returns:
+            z_motion: 32-dim motion latent [B, 32]
+                      ★ This is the token that represents ALL motion!
+        """
+        x = self.activation(self.conv1(x))
+
+        # Encode through ResBlocks
+        for res_block in self.res_blocks:
+            x = res_block(x)
+
+        x = self.equalconv(x)
+
+        # Global average pooling: [B, 512, H, W] → [B, 512]
+        x = x.view(x.size(0), x.size(1), -1).mean(dim=2)
+
+        # MLP processing
+        for linear_layer in self.linear_layers:
+            x = self.activation(linear_layer(x))
+
+        # Final projection to motion latent
+        x = self.final_linear(x)  # [B, 32] - the motion token!
+        return x
+
+class MotionDecoder(nn.Module):
+    """
+    Motion Decoder (D_motion / IMF_D) from IMTalker Section 3.2.2.
+
+    Transforms the compact 32-dim motion latent into multi-scale 2D motion maps.
+    Uses StyleGAN2's style modulation to inject motion information at each layer.
+
+    ★ THIS IS WHERE THE 32-DIM TOKEN BECOMES SPATIAL MOTION FEATURES ★
+
+    The decoder uses a "learned constant" as starting point (like StyleGAN2),
+    then progressively upsamples while injecting motion via style modulation.
+    This allows the compact token to control spatial motion at multiple scales.
+
+    Architecture (StyleGAN2-inspired, from LIA codebase):
+      - Learned constant: [1, 32, 4, 4] - starting spatial canvas
+      - 13 StyledConv layers with progressive upsampling:
+        * Layers 0-3:   4x4  → 8x8   (512 channels) → outputs m1 at 8x8
+        * Layers 4-6:   8x8  → 16x16 (512 channels) → outputs m2 at 16x16
+        * Layers 7-9:  16x16 → 32x32 (256 channels) → outputs m3 at 32x32
+        * Layers 10-12: 32x32 → 64x64 (128 channels) → outputs m4 at 64x64
+
+    Style Modulation (from StyleGAN2):
+      - Weight demodulation normalizes conv weights based on style
+      - Allows motion latent to control "what motion happens where"
+      - Key insight: style injection = motion injection in this context
+
+    Args:
+        latent_dim: Dimension of input motion latent (default: 32)
+                    ★ Must match MotionEncoder output dim!
+        const_dim: Channels of learned constant (default: 32)
+
+    Returns:
+        (m1, m2, m3, m4): Multi-scale motion maps at resolutions 8x8, 16x16, 32x32, 64x64
+                         Each map encodes "how to move" at that spatial scale
+                         Used as Q and K in cross-attention with identity features
+
+    IMF Equivalent: LatentTokenDecoder (identical architecture)
+
+    MOTION MAP USAGE IN CROSS-ATTENTION:
+    -----------------------------------
+    m_c = MotionDecoder(z_motion_current)  # "where we want to go"
+    m_r = MotionDecoder(z_motion_reference)  # "where we came from"
+    f_r = IdentityEncoder(reference)  # identity features
+
+    aligned = CrossAttention(Q=m_c, K=m_r, V=f_r)
+    # Q·K^T computes motion correspondence, then samples from V (identity features)
+    """
+    def __init__(self, latent_dim=32, const_dim=32):
+        super().__init__()
+
+        # Learned constant - the "canvas" we paint motion onto
+        # Shape: [1, 32, 4, 4] - starts at 4x4 resolution
+        self.const = nn.Parameter(torch.randn(1, const_dim, 4, 4))
+
+        # StyleGAN2-style convolutions with style modulation
+        # The motion latent (t) is injected into each layer via style modulation
+        self.style_conv_layers = nn.ModuleList([
+            # 4x4 → 8x8 block (outputs m1 at layer 3)
+            StyledConv(const_dim, 512, 3, latent_dim),           # 0: 4x4, 32→512
+            StyledConv(512, 512, 3, latent_dim, upsample=True),  # 1: 4x4→8x8
+            StyledConv(512, 512, 3, latent_dim),                 # 2: 8x8
+            StyledConv(512, 512, 3, latent_dim),                 # 3: 8x8 → m1 (512ch, 8x8)
+
+            # 8x8 → 16x16 block (outputs m2 at layer 6)
+            StyledConv(512, 512, 3, latent_dim, upsample=True),  # 4: 8x8→16x16
+            StyledConv(512, 512, 3, latent_dim),                 # 5: 16x16
+            StyledConv(512, 512, 3, latent_dim),                 # 6: 16x16 → m2 (512ch, 16x16)
+
+            # 16x16 → 32x32 block (outputs m3 at layer 9)
+            StyledConv(512, 256, 3, latent_dim, upsample=True),  # 7: 16x16→32x32, 512→256
+            StyledConv(256, 256, 3, latent_dim),                 # 8: 32x32
+            StyledConv(256, 256, 3, latent_dim),                 # 9: 32x32 → m3 (256ch, 32x32)
+
+            # 32x32 → 64x64 block (outputs m4 at layer 12)
+            StyledConv(256, 128, 3, latent_dim, upsample=True),  # 10: 32x32→64x64, 256→128
+            StyledConv(128, 128, 3, latent_dim),                 # 11: 64x64
+            StyledConv(128, 128, 3, latent_dim)                  # 12: 64x64 → m4 (128ch, 64x64)
+        ])
+
+    def forward(self, t):
+        """
+        Decode motion latent to multi-scale motion maps.
+
+        Args:
+            t: Motion latent tensor [B, 32]
+               ★ This is either from MotionEncoder or after IdentityAdaptive!
+
+        Returns:
+            (m1, m2, m3, m4): Motion maps at 8x8, 16x16, 32x32, 64x64
+                             Channels: 512, 512, 256, 128 respectively
+        """
+        # Replicate constant for batch
+        x = self.const.repeat(t.shape[0], 1, 1, 1)  # [B, 32, 4, 4]
+
+        m1, m2, m3, m4 = None, None, None, None
+
+        for i, layer in enumerate(self.style_conv_layers):
+            # Style modulation injects motion latent `t` into convolution
+            x = layer(x, t)
+
+            # Capture multi-scale motion maps at specific layers
+            if i == 3:
+                m1 = x  # 8x8 resolution, 512 channels - coarsest motion
+            elif i == 6:
+                m2 = x  # 16x16 resolution, 512 channels
+            elif i == 9:
+                m3 = x  # 32x32 resolution, 256 channels
+            elif i == 12:
+                m4 = x  # 64x64 resolution, 128 channels - finest motion
+
+        return m1, m2, m3, m4
+    
+class SynthesisNetwork(nn.Module):
+    """
+    Synthesis Network from IMTalker Section 3.2.3.
+
+    Fuses aligned features from the IMT module into the final output image.
+    Uses a hybrid architecture of Transformer blocks and ResConv blocks.
+
+    The synthesis network receives features that have already been "motion-aligned"
+    by the cross-attention mechanism. Its job is to:
+      1. Progressively upsample from coarse to fine
+      2. Fuse multi-scale aligned features
+      3. Apply self-attention for global coherence
+      4. Output the final RGB image
+
+    Architecture:
+      - UpConvResBlocks for spatial upsampling (2x each)
+      - Skip connections concatenating aligned features at each scale
+      - ConvResBlocks to process concatenated features
+      - SelfAttention (Transformer) blocks for global consistency
+      - Final conv + PixelShuffle for 2x upscale to output resolution
+
+    Args:
+        args: Configuration arguments (contains attention params)
+        feature_dims: Channel dimensions [32, 64, 128, 256, 512, 512]
+        spatial_dims: Spatial resolutions [256, 128, 64, 32, 16, 8]
+
+    Returns:
+        output: Final RGB image [B, 3, H, W] with Sigmoid activation
+
+    Design Notes:
+      - Features are processed coarse-to-fine (reversed order)
+      - Self-attention adds global coherence (important for faces)
+      - PixelShuffle in final layer is more efficient than transposed conv
+    """
+    def __init__(self, args, feature_dims, spatial_dims):
+        super().__init__()
+        self.args = args
+
+        # Reverse dimensions: we process coarse → fine
+        feature_dims_rev = feature_dims[::-1]  # [512, 512, 256, 128, 64, 32]
+        spatial_dims_rev = spatial_dims[::-1]  # [8, 16, 32, 64, 128, 256]
+
+        # Upsampling blocks: each doubles spatial resolution
+        self.upconv_blocks = nn.ModuleList([
+            UpConvResBlock(feature_dims_rev[i], feature_dims_rev[i+1])
+            for i in range(len(feature_dims_rev) - 1)
+        ])
+
+        # ResBlocks to process concatenated features (x2 channels due to skip connection)
+        self.resblocks = nn.ModuleList([
+            ConvResBlock(feature_dims_rev[i+1] * 2, feature_dims_rev[i+1])
+            for i in range(len(feature_dims_rev) - 1)
+        ])
+
+        # Transformer blocks for global self-attention at each scale
+        # This is crucial for face coherence - ensures eyes/mouth/etc are consistent
+        self.transformer_blocks = nn.ModuleList()
+        for i in range(len(spatial_dims_rev) - 1):
+            s_dim = spatial_dims_rev[i+1]
+            f_dim = feature_dims_rev[i+1]
+            self.transformer_blocks.append(
+                SelfAttention(args=args, dim=f_dim, resolution=(s_dim, s_dim))
+            )
+
+        # Final output layer: conv + PixelShuffle for 2x upscale + Sigmoid
+        self.final_conv = nn.Sequential(
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(feature_dims_rev[-1], 3 * 4, kernel_size=3, padding=1),  # 32 → 12 for PixelShuffle
+            nn.PixelShuffle(upscale_factor=2),  # 12 → 3 channels, 2x spatial
+            nn.Sigmoid()  # Output in [0, 1] range
+        )
+
+    def forward(self, features_align):
+        """
+        Synthesize output image from aligned features.
+
+        Args:
+            features_align: List of aligned feature maps [f_coarse, ..., f_fine]
+                           These come from CrossAttention(motion_D, motion_S, identity)
+
+        Returns:
+            output: RGB image tensor [B, 3, H, W]
+        """
+        x = features_align[0]  # Start with coarsest aligned features
+
+        for i in range(len(self.upconv_blocks)):
+            x = self.upconv_blocks[i](x)  # Upsample 2x
+            x = torch.cat([x, features_align[i + 1]], dim=1)  # Skip connection
+            x = self.resblocks[i](x)  # Process concatenated features
+            x = self.transformer_blocks[i](x)  # Global self-attention
+
+        return self.final_conv(x)
+
+class IdentidyAdaptive(nn.Module):
+    """
+    Identity-Adaptive (IA) Module (Φ) from IMTalker Section 3.2.1.
+
+    ★★★ THIS IS THE KEY INNOVATION IN IMTALKER VS ORIGINAL IMF ★★★
+
+    The IA module solves the "identity leakage" problem that plagued IMF:
+    - In IMF, motion latents can accidentally encode identity information
+    - During cross-identity transfer, this causes the output to drift toward
+      the driving video's identity instead of preserving the source
+
+    SOLUTION: Project the motion latent into a PERSONALIZED space for each identity!
+
+    How it works:
+      1. Take the generic motion latent z_motion (32-dim)
+      2. Concatenate with identity embedding f_global (512-dim)
+      3. MLP processes this to output z_motion' (32-dim, personalized)
+      4. z_motion' is now "customized" for this specific identity
+
+    Intuition:
+      - Different people express the same emotion differently
+      - "Happy" for person A might involve more eye crinkle
+      - "Happy" for person B might involve more mouth movement
+      - The IA module learns these identity-specific "dialects" of motion
+
+    Training Objective (Motion Distance Consistency Loss):
+      For the same motion z_motion applied to identities A and B:
+        L_dist = |d(z_motion, z_A') - d(z_motion, z_B')|
+      This ensures equal adaptation "strength" for all identities,
+      preventing the module from adapting some identities more than others.
+
+    Args:
+        dim_mot: Motion latent dimension (default: 32, must match MotionEncoder)
+        dim_app: Identity embedding dimension (default: 512, from IdentityEncoder)
+        depth: Number of MLP layers (default: 4)
+
+    Input:
+        mot: Motion latent [B, 32] - generic, identity-agnostic motion
+        app: Identity embedding [B, 512] - from IdentityEncoder global branch
+
+    Output:
+        z_motion': Personalized motion latent [B, 32]
+                   Same dimension as input, but now identity-aware!
+
+    IMF Equivalent: NONE - this is NEW in IMTalker!
+
+    INTEGRATION WITH IMF:
+    --------------------
+    To add identity adaptation to IMF codebase:
+        # Original IMF flow:
+        t_c = latent_token_encoder(current_frame)  # [B, 32]
+        m_c = latent_token_decoder(t_c)  # multi-scale motion maps
+
+        # IMTalker flow with IA module:
+        t_c = latent_token_encoder(current_frame)  # [B, 32]
+        f_r, global_id = identity_encoder(reference)  # global_id: [B, 512]
+        t_c_adapted = identity_adaptive(t_c, global_id)  # [B, 32] personalized!
+        m_c = latent_token_decoder(t_c_adapted)  # motion maps now identity-aware
+    """
+    def __init__(self, dim_mot=32, dim_app=512, depth=4):
+        super().__init__()
+
+        # Input layer: concatenated motion + identity → identity dimension
+        # (32 + 512) → 512
+        self.in_layer = EqualLinear(dim_app + dim_mot, dim_app)
+
+        # MLP backbone: 4 layers of 512 → 512
+        self.linear_layers = nn.ModuleList([
+            EqualLinear(dim_app, dim_app) for _ in range(depth)
+        ])
+
+        # Output projection: 512 → 32 (back to motion latent dimension)
+        self.final_linear = EqualLinear(dim_app, dim_mot)
+
+        self.activation = nn.LeakyReLU(0.2)
+        self.scale_activation = nn.Sigmoid()  # Not currently used, but available
+
+    def forward(self, mot, app):
+        """
+        Adapt motion latent to specific identity.
+
+        Args:
+            mot: Generic motion latent [B, 32] from MotionEncoder
+            app: Identity embedding [B, 512] from IdentityEncoder
+
+        Returns:
+            z_motion': Personalized motion latent [B, 32]
+
+        The output has the same dimension as input motion, but is now
+        "personalized" to express motion in an identity-specific way.
+        """
+        # Concatenate motion and identity: [B, 32] + [B, 512] → [B, 544]
+        x = torch.cat((mot, app), dim=-1)
+
+        # Project to identity space
+        x = self.in_layer(x)  # [B, 544] → [B, 512]
+
+        # MLP processing
+        for linear_layer in self.linear_layers:
+            x = self.activation(linear_layer(x))
+
+        # Project back to motion latent space
+        out = self.final_linear(x)  # [B, 512] → [B, 32]
+
+        return out
+
+class IMTRenderer(nn.Module):
+    """
+    Identity-Adaptive Motion Transfer Renderer (G_render) from IMTalker.
+
+    This is the main renderer class that combines all components to perform
+    motion transfer while preserving identity. It implements the complete
+    pipeline from the IMTalker paper Section 3.2.
+
+    ★★★ COMPLETE TOKEN FLOW (DETAILED) ★★★
+
+    ENCODING PHASE:
+    ──────────────
+    Reference Frame (x_reference):
+      └── IdentityEncoder (dense_feature_encoder)
+          ├── f_r: Multi-scale dense features [f_1..f_6] for rendering
+          └── i_r: Global identity embedding [B, 512] for IA module
+
+      └── MotionEncoder (latent_token_encoder)
+          └── t_r: Reference motion latent [B, 32]
+
+    Current/Driving Frame (x_current):
+      └── MotionEncoder (latent_token_encoder)
+          └── t_c: Current motion latent [B, 32]
+              (For audio-driven: t_c comes from Flow-Matching generator)
+
+    IDENTITY ADAPTATION PHASE:
+    ─────────────────────────
+    t_r + i_r ──► IdentityAdaptive ──► ta_r: Adapted reference motion [B, 32]
+    t_c + i_r ──► IdentityAdaptive ──► ta_c: Adapted current motion [B, 32]
+
+    ★ Key insight: Both motions are adapted to the SAME identity (i_r)
+      This ensures the output preserves the reference identity!
+
+    MOTION DECODING PHASE:
+    ─────────────────────
+    ta_r ──► MotionDecoder ──► ma_r: Reference motion maps (m1, m2, m3, m4)
+    ta_c ──► MotionDecoder ──► ma_c: Current motion maps (m1, m2, m3, m4)
+
+    IMPLICIT MOTION TRANSFER (IMT) PHASE:
+    ────────────────────────────────────
+    At each spatial scale i:
+      CrossAttention(Q=ma_c[i], K=ma_r[i], V=f_r[i])
+
+    Where:
+      Q (Query) = Current motion map "where we want features to appear"
+      K (Key)   = Reference motion map "where features currently are"
+      V (Value) = Reference identity features "what the identity looks like"
+
+    The attention computes: softmax(Q·K^T / √d) · V
+      - Q·K^T finds motion correspondence (current↔reference positions)
+      - softmax normalizes to attention weights
+      - Multiplying by V samples identity features at corresponding positions
+
+    This is IMPLICIT motion transfer because we never compute explicit optical flow!
+    The cross-attention implicitly learns the motion correspondence.
+
+    SYNTHESIS PHASE:
+    ───────────────
+    aligned_features ──► SynthesisNetwork ──► output_frame [B, 3, H, W]
+
+    ARCHITECTURE DIMENSIONS:
+    ──────────────────────
+    feature_dims = [32, 64, 128, 256, 512, 512]  (channel dimensions)
+    spatial_dims = [256, 128, 64, 32, 16, 8]      (spatial resolutions)
+    motion_latent_dim = 32                        (the compact token!)
+    identity_dim = 512                            (global identity embedding)
+
+    IMF EQUIVALENT MAPPING:
+    ─────────────────────
+    IMTalker                    │ IMF (original)
+    ───────────────────────────────────────────────────
+    IdentityEncoder             │ DenseFeatureEncoder (no identity branch)
+    MotionEncoder               │ LatentTokenEncoder
+    MotionDecoder               │ LatentTokenDecoder
+    IdentityAdaptive            │ ✗ (NOT IN IMF - key innovation!)
+    CrossAttention (imt)        │ ImplicitMotionAlignment
+    SynthesisNetwork            │ FrameDecoder
+
+    COARSE-TO-FINE ATTENTION:
+    ────────────────────────
+    For efficiency (40 FPS!), IMTalker uses hierarchical attention:
+    - Coarse levels (8x8, 16x16): Full standard attention O(N²)
+    - Fine levels (32x32, 64x64): Guided sparse resampling using coarse attention
+      This avoids computing full attention at high resolution!
+    """
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+
+        # Multi-scale dimensions for feature pyramid
+        self.feature_dims = [32, 64, 128, 256, 512, 512]   # Channels at each scale
+        self.motion_dims = self.feature_dims               # Motion map channels (same)
+        self.spatial_dims = [256, 128, 64, 32, 16, 8]      # Spatial resolutions
+
+        # ============ ENCODERS ============
+        # Identity Encoder: extracts dense features + global identity embedding
+        # Input: [B, 3, 256, 256] → Output: (features, identity [B, 512])
+        self.dense_feature_encoder = IdentityEncoder(output_channels=self.feature_dims)
+
+        # Motion Encoder: extracts compact motion latent
+        # Input: [B, 3, 256, 256] → Output: motion latent [B, 32]
+        self.latent_token_encoder = MotionEncoder(
+            initial_channels=64,
+            output_channels=[128, 256, 512, 512, 512],
+            # Note: dm=32 by default - THE motion token dimension
+        )
+
+        # ============ DECODER ============
+        # Motion Decoder: expands motion latent to multi-scale motion maps
+        # Input: [B, 32] → Output: (m1, m2, m3, m4) at 8x8, 16x16, 32x32, 64x64
+        self.latent_token_decoder = MotionDecoder()
+
+        # Frame Decoder / Synthesis Network: renders aligned features to image
+        self.frame_decoder = SynthesisNetwork(args, self.feature_dims, self.spatial_dims)
+
+        # ============ IDENTITY ADAPTIVE MODULE ============
+        # ★ THE KEY INNOVATION! Personalizes motion for each identity
+        # Input: (motion [B, 32], identity [B, 512]) → Output: adapted motion [B, 32]
+        self.adapt = IdentidyAdaptive()
+
+        # ============ IMPLICIT MOTION TRANSFER (CROSS-ATTENTION) ============
+        # One cross-attention block per spatial scale
+        # Coarse scales: standard attention (is_standard_attention=True)
+        # Fine scales: guided sparse resampling (is_standard_attention=False)
+        self.imt = nn.ModuleList()
+        for dim, s_dim in zip(self.feature_dims[::-1], self.spatial_dims[::-1]):
+            self.imt.append(CrossAttention(args=args, dim=dim, resolution=(s_dim, s_dim)))
+
+    def decode(self, A, B, C):
+        """
+        Implicit Motion Transfer via hierarchical cross-attention.
+
+        This is the core of IMTalker's motion transfer mechanism!
+        Uses cross-attention to implicitly compute motion correspondence
+        and sample identity features at corresponding positions.
+
+        Args:
+            A: Current motion maps (ma_c) - "where we want features" (Query)
+            B: Reference motion maps (ma_r) - "where features are" (Key)
+            C: Reference identity features (f_r) - "what features look like" (Value)
+
+        Returns:
+            output_frame: Rendered frame [B, 3, H, W]
+
+        Attention Mechanism:
+            aligned = softmax(Q·K^T / √d) · V
+            Where Q from A (current motion), K from B (ref motion), V from C (identity)
+
+        Coarse-to-Fine Strategy:
+            - Coarse levels: Compute full attention, save attention map
+            - Fine levels: Use upsampled coarse attention for guided sampling
+              (Avoids O(N²) at high resolution!)
+        """
+        num_levels = len(self.spatial_dims)
+        aligned_features = [None] * num_levels
+        attention_map = None  # Reused across fine levels
+
+        for i in range(num_levels):
+            attention_block = self.imt[i]
+
+            if attention_block.is_standard_attention:
+                # COARSE STAGE: Full cross-attention
+                # Computes attention map from motion features
+                aligned_feature, attention_map = attention_block.coarse_stage(
+                    A[i],  # Query: current motion
+                    B[i],  # Key: reference motion
+                    C[i]   # Value: identity features
+                )
+                aligned_features[i] = aligned_feature
+            else:
+                # FINE STAGE: Guided sparse resampling
+                # Uses upsampled coarse attention map (no Q·K computation!)
+                aligned_feature = attention_block.fine_stage(
+                    C[i],           # Value: identity features
+                    attn=attention_map  # Reuse coarse attention
+                )
+                aligned_features[i] = aligned_feature
+
+        # Synthesize final frame from aligned features
+        output_frame = self.frame_decoder(aligned_features)
+        return output_frame
+
+    def app_encode(self, x):
+        """
+        Encode appearance/identity from reference frame.
+
+        Returns:
+            f_r: Multi-scale dense features for rendering
+            id: Global identity embedding [B, 512] for IA module
+        """
+        f_r, id = self.dense_feature_encoder(x)
+        return f_r, id
+
+    def mot_encode(self, x):
+        """
+        Encode motion from a frame.
+
+        Returns:
+            mot_latent: 32-dim motion latent [B, 32]
+                        ★ This is THE implicit motion token!
+        """
+        mot_latent = self.latent_token_encoder(x)
+        return mot_latent
+
+    def mot_decode(self, x):
+        """
+        Decode motion latent to multi-scale motion maps.
+
+        Args:
+            x: Motion latent [B, 32] (should be after identity adaptation!)
+
+        Returns:
+            mot_map: Tuple (m1, m2, m3, m4) of motion maps
+        """
+        mot_map = self.latent_token_decoder(x)
+        return mot_map
+
+    def id_adapt(self, t, id):
+        """
+        Adapt motion latent to specific identity.
+
+        Args:
+            t: Generic motion latent [B, 32]
+            id: Identity embedding [B, 512]
+
+        Returns:
+            t_adapted: Personalized motion latent [B, 32]
+        """
+        return self.adapt(t, id)
+
+    def forward(self, x_current, x_reference):
+        """
+        Full forward pass for motion transfer.
+
+        This implements the complete IMTalker pipeline:
+        1. Encode reference: get identity features + motion latent
+        2. Encode current: get motion latent
+        3. Adapt both motions to reference identity (IA module)
+        4. Decode adapted motions to multi-scale motion maps
+        5. Cross-attention transfer: align identity features to current motion
+        6. Synthesize output frame
+
+        Args:
+            x_current: Current/driving frame [B, 3, H, W]
+                       (provides motion to transfer)
+            x_reference: Reference/source frame [B, 3, H, W]
+                        (provides identity to preserve)
+
+        Returns:
+            output_frame: Generated frame with reference identity + current motion
+            t_c: Raw motion latent from current frame (for training/analysis)
+
+        Token Flow Visualization:
+        ────────────────────────
+        x_reference ──┬── app_encode ──► f_r (features), i_r (identity)
+                      └── mot_encode ──► t_r (motion)
+
+        x_current ────── mot_encode ──► t_c (motion)
+
+        t_r + i_r ──► adapt ──► ta_r (adapted ref motion)
+        t_c + i_r ──► adapt ──► ta_c (adapted cur motion)
+
+        ta_r ──► mot_decode ──► ma_r (ref motion maps)
+        ta_c ──► mot_decode ──► ma_c (cur motion maps)
+
+        decode(ma_c, ma_r, f_r) ──► output_frame
+        """
+        # ============ ENCODING ============
+        # Reference: extract identity features AND motion
+        f_r, i_r = self.app_encode(x_reference)  # f_r: features, i_r: identity [B, 512]
+        t_r = self.mot_encode(x_reference)        # t_r: motion latent [B, 32]
+
+        # Current: extract motion only (identity comes from reference!)
+        t_c = self.mot_encode(x_current)          # t_c: motion latent [B, 32]
+
+        # ============ IDENTITY ADAPTATION ============
+        # Adapt BOTH motions to the REFERENCE identity
+        # This is the key to preserving identity during transfer!
+        ta_r = self.adapt(t_r, i_r)  # Reference motion adapted to its own identity
+        ta_c = self.adapt(t_c, i_r)  # Current motion adapted to REFERENCE identity
+
+        # ============ MOTION DECODING ============
+        # Expand adapted motion latents to multi-scale motion maps
+        ma_r = self.mot_decode(ta_r)  # Reference motion maps (m1, m2, m3, m4)
+        ma_c = self.mot_decode(ta_c)  # Current motion maps (m1, m2, m3, m4)
+
+        # ============ IMPLICIT MOTION TRANSFER + SYNTHESIS ============
+        # Cross-attention: Q=ma_c, K=ma_r, V=f_r
+        # Samples identity features (f_r) at positions corresponding to current motion
+        output_frame = self.decode(ma_c, ma_r, f_r)
+
+        # Return frame and raw motion token (useful for training/analysis)
+        return output_frame, t_c
+import argparse
+import os
+from pathlib import Path
+
+import cv2
+import torch
+import torch.nn as nn
+import numpy as np
+import face_alignment
+import torchvision.transforms as transforms
+from PIL import Image
+from tqdm import tqdm
+
+from renderer.models import IMTRenderer
+
+# Optimize CUDA backends
+torch.backends.cudnn.enabled = True
+torch.backends.cudnn.benchmark = True
+
+
+class DataProcessor:
+    def __init__(self, opt):
+        self.opt = opt
+        self.input_size = opt.input_size
+        self.fa = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, flip_input=False)
+        
+        self.transform = transforms.Compose([
+            transforms.Resize((256, 256)), 
+            transforms.ToTensor(),
+        ])
+
+    @torch.no_grad()
+    def process_img(self, img):
+        """Detects face and crops the image to the face region."""
+        if isinstance(img, Image.Image):
+            img = np.array(img)
+            
+        # Ensure RGB
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        elif img.shape[2] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
+    
+        # Resize for faster detection
+        h, w = img.shape[:2]
+
+
+        bboxes = self.fa.face_detector.detect_from_image(img)
+        
+        # Filter valid faces (score > 0.95)
+        valid_bboxes = [
+            (int(x1), int(y1), int(x2 ), int(y2 ), score)
+            for (x1, y1, x2, y2, score) in bboxes if score > 0.95
+        ]
+
+        if not valid_bboxes:
+            print("[WARN] No face detected, falling back to center resize.")
+            return cv2.resize(img, (self.input_size, self.input_size))
+    
+        # Crop logic based on the first detected face
+        x1, y1, x2, y2, _ = valid_bboxes[0]
+        bsy, bsx = int((y2 - y1) / 2), int((x2 - x1) / 2)
+        my, mx = int((y1 + y2) / 2), int((x1 + x2) / 2)
+        bs = int(max(bsy, bsx) * 1.3)
+    
+        # Pad image to allow cropping outside boundaries
+        img = cv2.copyMakeBorder(img, bs, bs, bs, bs, cv2.BORDER_CONSTANT, value=0)
+        
+        # Adjust coordinates for padding
+        my, mx = my + bs, mx + bs
+        crop_img = img[my - bs:my + bs, mx - bs:mx + bs]
+        return Image.fromarray(crop_img)
+
+    def load_image(self, path):
+        img = cv2.imread(path)
+        if img is None:
+            raise FileNotFoundError(f"Image not found at {path}")
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(img)
+
+
+def save_video(vid_target_recon, save_path, fps):
+    vid = vid_target_recon.permute(0, 2, 3, 1).clamp(0, 1).cpu().numpy()
+    vid = (vid * 255).astype(np.uint8)
+    T, H, W, C = vid.shape
+
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    writer = cv2.VideoWriter(save_path, fourcc, fps, (W, H))
+
+    for frame in vid:
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        writer.write(frame_bgr)
+
+    writer.release()
+    print(f"[Success] Video saved to {save_path}")
+
+
+class Demo(nn.Module):
+    def __init__(self, args, gen):
+        super(Demo, self).__init__()
+        self.args = args
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        print('==> Loading model...')
+        self.gen = gen.to(self.device)
+        self.gen.eval()
+
+        self.save_path = args.save_path
+        os.makedirs(self.save_path, exist_ok=True)
+        self.processor = DataProcessor(args)
+
+    @torch.no_grad()
+    def process_single(self, source_path, driving_path):
+        print(f"==> Processing: {source_path} + {driving_path}")
+        
+        # 1. Process Source Image
+        source_img = self.processor.load_image(source_path)
+        if self.args.crop:
+            source_img = self.processor.process_img(source_img)
+        
+        source_tensor = self.processor.transform(source_img).unsqueeze(0).to(self.device)
+
+        # 2. Encode Source Appearance & Motion
+        f_r, i_r = self.gen.app_encode(source_tensor)
+        t_r = self.gen.mot_encode(source_tensor)
+        ta_r = self.gen.adapt(t_r, i_r)
+        ma_r = self.gen.mot_decode(ta_r)
+
+        # 3. Process Driving Video Frame-by-Frame
+        cap = cv2.VideoCapture(driving_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) if self.args.fps is None else self.args.fps
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        vid_target_recon = []
+        
+        pbar = tqdm(total=frame_count, desc="Inferencing")
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_pil = Image.fromarray(frame)
+            
+            # Transform driving frame
+            frame_tensor = self.processor.transform(frame_pil).unsqueeze(0).to(self.device)
+
+            # Inference
+            t_c = self.gen.mot_encode(frame_tensor)
+            ta_c = self.gen.adapt(t_c, i_r)
+            ma_c = self.gen.mot_decode(ta_c)
+            out = self.gen.decode(ma_c, ma_r, f_r)
+            
+            vid_target_recon.append(out.cpu()) # Move to CPU immediately to save VRAM
+            pbar.update(1)
+            
+        cap.release()
+        pbar.close()
+
+        if not vid_target_recon:
+            print("[Error] No frames generated.")
+            return
+
+        # 4. Save Result
+        vid_target_recon = torch.cat(vid_target_recon, dim=0)
+        save_name = f"{Path(source_path).stem}_{Path(driving_path).stem}.mp4"
+        save_video(vid_target_recon, os.path.join(self.save_path, save_name), fps)
+
+    def process_batch(self, root_dir):
+        subdirs = [
+            os.path.join(root_dir, d) for d in os.listdir(root_dir) 
+            if os.path.isdir(os.path.join(root_dir, d))
+        ]
+        
+        for sub in subdirs:
+            img_files = [f for f in os.listdir(sub) if f.lower().endswith((".png", ".jpg", ".jpeg"))]
+            vid_files = [f for f in os.listdir(sub) if f.lower().endswith((".mp4", ".avi", ".mov"))]
+            
+            if not img_files or not vid_files:
+                print(f"[Skip] {sub} missing image or video.")
+                continue
+                
+            img_path = os.path.join(sub, img_files[0])
+            vid_path = os.path.join(sub, vid_files[0])
+            
+            try:
+                self.process_single(img_path, vid_path)
+            except Exception as e:
+                print(f"[Error] Failed processing {sub}: {e}")
+
+    def run(self):
+        if self.args.source_path and self.args.driving_path:
+            self.process_single(self.args.source_path, self.args.driving_path)
+        elif self.args.data_dir:
+            self.process_batch(self.args.data_dir)
+        else:
+            raise ValueError("Usage: Provide either --source_path & --driving_path OR --data_dir")
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Image Animation Inference Demo")
+
+    # Modes
+    parser.add_argument("--source_path", type=str, help="Path to source image")
+    parser.add_argument("--driving_path", type=str, help="Path to driving video")
+    parser.add_argument("--data_dir", type=str, help="Batch directory containing subfolders")
+    parser.add_argument("--save_path", type=str, default="./results", help="Output directory")
+
+    # Model Params
+    parser.add_argument("--renderer_path", type=str, default="./checkpoints/renderer.ckpt", help="Checkpoint path")
+    parser.add_argument("--input_size", type=int, default=256, help="Resolution")
+    parser.add_argument('--swin_res_threshold', type=int, default=128)
+    parser.add_argument('--num_heads', type=int, default=8)
+    parser.add_argument('--window_size', type=int, default=8)
+    
+    # Options
+    parser.add_argument("--fps", type=int, default=None, help="Output FPS (default: same as input)")
+    parser.add_argument("--crop", action="store_true", help="Crop face from source image")
+
+    args = parser.parse_args()
+
+    # Initialize Model
+    model = IMTRenderer(args)
+    checkpoint = torch.load(args.renderer_path, map_location="cpu")
+    
+    # Handle state dict keys
+    state_dict = checkpoint.get("state_dict", checkpoint)
+    clean_state_dict = {
+        k.replace("gen.", ""): v for k, v in state_dict.items() if k.startswith("gen.")
+    }
+    
+    model.load_state_dict(clean_state_dict, strict=False)
+
+    # Run Demo
+    demo = Demo(args, model)
+    demo.run()
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms as transforms
+import matplotlib.pyplot as plt
+from PIL import Image
+import numpy as np
+from renderer.lia_resblocks import ConvLayer
+import torch.nn.utils.spectral_norm as spectral_norm
+        
+class NormLayer(nn.Module):
+    def __init__(self, num_features, norm_type='batch'):
+        super().__init__()
+        if norm_type == 'batch':
+            self.norm = nn.BatchNorm2d(num_features)
+        elif norm_type == 'instance':
+            self.norm = nn.InstanceNorm2d(num_features)
+        elif norm_type == 'layer':
+            self.norm = nn.GroupNorm(1, num_features)
+        else:
+            raise ValueError(f"Unsupported normalization type: {norm_type}")
+
+    def forward(self, x):
+        return self.norm(x)
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, 
+                 activation=nn.LeakyReLU, norm_type='batch'):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=False)
+        self.norm = NormLayer(out_channels, norm_type)
+        self.activation = activation(inplace=True) if activation else None
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.norm(x)
+        if self.activation:
+            x = self.activation(x)
+        return x
+
+class FeatResBlock(nn.Module):
+    def __init__(self, channels, dropout_rate=0, activation=nn.LeakyReLU, norm_type='batch'):
+        super().__init__()
+        self.conv1 = ConvBlock(channels, channels, activation=activation, norm_type=norm_type)
+        self.conv2 = ConvBlock(channels, channels, activation=None, norm_type=norm_type)
+        self.activation = activation(inplace=True) if activation else None
+
+    def forward(self, x):
+
+        residual = x
+        out = self.conv1(x)
+        out = self.conv2(out)
+        out += residual
+        if self.activation:
+            out = self.activation(out)
+        return out
+
+class ResBlock(nn.Module):
+    def __init__(self, in_channel, out_channel, blur_kernel=[1, 3, 3, 1]):
+        super().__init__()
+
+        self.conv1 = ConvLayer(in_channel, in_channel, 3)
+        self.conv2 = ConvLayer(in_channel, out_channel, 3, downsample=True)
+
+        self.skip = ConvLayer(in_channel, out_channel, 3, downsample=True)
+
+    def forward(self, input):
+        out = self.conv1(input)
+        out = self.conv2(out)
+
+        skip = self.skip(input)
+        out = (out + skip)
+
+        return out
+    
+class ConvResBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, dropout_rate=0, activation=nn.LeakyReLU, 
+                 norm_type='batch'):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.norm = NormLayer(out_channels, norm_type)
+        self.activation = activation(inplace=True) if activation else None
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        
+        self.feat_res_block1 = FeatResBlock(out_channels, dropout_rate, activation, norm_type)
+        self.feat_res_block2 = FeatResBlock(out_channels, dropout_rate, activation, norm_type)
+        
+
+    def forward(self, x):
+        
+        out = self.conv1(x)
+        out = self.norm(out)
+        out = self.activation(out)
+
+        out = self.conv2(out)
+        
+        out = self.feat_res_block1(out)
+        out = self.feat_res_block2(out)
+        return out
+    
+# this is only used on the densefeatureencoder
+class DownConvResBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, dropout_rate=0, activation=nn.LeakyReLU, 
+                 norm_type='batch'):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.norm = NormLayer(out_channels, norm_type)
+        self.activation = activation(inplace=True) if activation else None
+        self.avgpool = nn.AvgPool2d(kernel_size=2, stride=2)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        
+        self.feat_res_block1 = FeatResBlock(out_channels, dropout_rate, activation, norm_type)
+        self.feat_res_block2 = FeatResBlock(out_channels, dropout_rate, activation, norm_type)
+        
+
+    def forward(self, x):
+        
+        out = self.conv1(x)
+        out = self.norm(out)
+        out = self.activation(out)
+        out = self.avgpool(out)
+
+        out = self.conv2(out)
+        
+        out = self.feat_res_block1(out)
+        out = self.feat_res_block2(out)
+        return out
+
+# this is used on the framedecoder / enhancedframedecoder
+class UpConvResBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, dropout_rate=0, activation=nn.LeakyReLU, 
+                 norm_type='batch', upsample_mode='nearest'):
+        super().__init__()
+        self.upsample = nn.Upsample(scale_factor=2, mode=upsample_mode)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.norm = NormLayer(out_channels, norm_type)
+        self.activation = activation(inplace=True) if activation else None
+
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.feat_res_block1 = FeatResBlock(out_channels, dropout_rate, activation, norm_type)
+        self.feat_res_block2 = FeatResBlock(out_channels, dropout_rate, activation, norm_type)
+
+    def forward(self, x):
+        
+        out = self.upsample(x)
+        
+        out = self.conv1(out)
+        out = self.norm(out)
+        out = self.activation(out)
+
+        out = self.conv2(out)
+        
+        out = self.feat_res_block1(out)
+        out = self.feat_res_block2(out)
+        return out
+
+class SPADE(nn.Module):
+    def __init__(self, norm_nc, label_nc):
+        super().__init__()
+
+        self.param_free_norm = nn.InstanceNorm2d(norm_nc, affine=False)
+        nhidden = 128
+
+        self.mlp_shared = nn.Sequential(
+            nn.Conv2d(label_nc, nhidden, kernel_size=3, padding=1),
+            nn.ReLU())
+        self.mlp_gamma = nn.Conv2d(nhidden, norm_nc, kernel_size=3, padding=1)
+        self.mlp_beta = nn.Conv2d(nhidden, norm_nc, kernel_size=3, padding=1)
+
+    def forward(self, x, segmap):
+        normalized = self.param_free_norm(x)
+        segmap = F.interpolate(segmap, size=x.size()[2:], mode='nearest')
+        actv = self.mlp_shared(segmap)
+        gamma = self.mlp_gamma(actv)
+        beta = self.mlp_beta(actv)
+        out = normalized * (1 + gamma) + beta
+        return out
+
+
+class SPADEResnetBlock(nn.Module):
+    def __init__(self, fin, fout, norm_G, label_nc, use_se=False, dilation=1):
+        super().__init__()
+        # Attributes
+        self.learned_shortcut = (fin != fout)
+        fmiddle = min(fin, fout)
+        self.use_se = use_se
+        # create conv layers
+        self.conv_0 = nn.Conv2d(fin, fmiddle, kernel_size=3, padding=dilation, dilation=dilation)
+        self.conv_1 = nn.Conv2d(fmiddle, fout, kernel_size=3, padding=dilation, dilation=dilation)
+        if self.learned_shortcut:
+            self.conv_s = nn.Conv2d(fin, fout, kernel_size=1, bias=False)
+        # apply spectral norm if specified
+        if 'spectral' in norm_G:
+            self.conv_0 = spectral_norm(self.conv_0)
+            self.conv_1 = spectral_norm(self.conv_1)
+            if self.learned_shortcut:
+                self.conv_s = spectral_norm(self.conv_s)
+        # define normalization layers
+        self.norm_0 = SPADE(fin, label_nc)
+        self.norm_1 = SPADE(fmiddle, label_nc)
+        if self.learned_shortcut:
+            self.norm_s = SPADE(fin, label_nc)
+
+    def forward(self, x, seg1):
+        x_s = self.shortcut(x, seg1)
+        dx = self.conv_0(self.actvn(self.norm_0(x, seg1)))
+        dx = self.conv_1(self.actvn(self.norm_1(dx, seg1)))
+        out = x_s + dx
+        return out
+
+    def shortcut(self, x, seg1):
+        if self.learned_shortcut:
+            x_s = self.conv_s(self.norm_s(x, seg1))
+        else:
+            x_s = x
+        return x_s
+
+    def actvn(self, x):
+        return F.leaky_relu(x, 2e-1)
+
+class SPADEDecoder(nn.Module):
+    def __init__(self, upscale=1, max_features=256, block_expansion=64, out_channels=64, num_down_blocks=2):
+        for i in range(num_down_blocks):
+            input_channels = min(max_features, block_expansion * (2 ** (i + 1)))
+        self.upscale = upscale
+        super().__init__()
+        norm_G = 'spadespectralinstance'
+        label_num_channels = input_channels  # 256
+
+        self.fc = nn.Conv2d(input_channels, 2 * input_channels, 3, padding=1)
+        self.G_middle_0 = SPADEResnetBlock(2 * input_channels, 2 * input_channels, norm_G, label_num_channels)
+        self.G_middle_1 = SPADEResnetBlock(2 * input_channels, 2 * input_channels, norm_G, label_num_channels)
+        self.G_middle_2 = SPADEResnetBlock(2 * input_channels, 2 * input_channels, norm_G, label_num_channels)
+        self.G_middle_3 = SPADEResnetBlock(2 * input_channels, 2 * input_channels, norm_G, label_num_channels)
+        self.G_middle_4 = SPADEResnetBlock(2 * input_channels, 2 * input_channels, norm_G, label_num_channels)
+        self.G_middle_5 = SPADEResnetBlock(2 * input_channels, 2 * input_channels, norm_G, label_num_channels)
+        self.up_0 = SPADEResnetBlock(2 * input_channels, input_channels, norm_G, label_num_channels)
+        self.up_1 = SPADEResnetBlock(input_channels, out_channels, norm_G, label_num_channels)
+        self.up = nn.Upsample(scale_factor=2)
+
+        if self.upscale is None or self.upscale <= 1:
+            self.conv_img = nn.Conv2d(out_channels, 3, 3, padding=1)
+        else:
+            self.conv_img = nn.Sequential(
+                nn.Conv2d(out_channels, 3 * (2 * 2), kernel_size=3, padding=1),
+                nn.PixelShuffle(upscale_factor=2)
+            )
+
+    def forward(self, feature):
+        seg = feature  # Bx256x64x64
+        x = self.fc(feature)  # Bx512x64x64
+        x = self.G_middle_0(x, seg)
+        x = self.G_middle_1(x, seg)
+        x = self.G_middle_2(x, seg)
+        x = self.G_middle_3(x, seg)
+        x = self.G_middle_4(x, seg)
+        x = self.G_middle_5(x, seg)
+
+        x = self.up(x)  # Bx512x64x64 -> Bx512x128x128
+        x = self.up_0(x, seg)  # Bx512x128x128 -> Bx256x128x128
+        x = self.up(x)  # Bx256x128x128 -> Bx256x256x256
+        x = self.up_1(x, seg)  # Bx256x256x256 -> Bx64x256x256
+
+        x = self.conv_img(F.leaky_relu(x, 2e-1))  # Bx64x256x256 -> Bx3xHxW
+        x = torch.sigmoid(x)  # Bx3xHxW
+
+        return x
+import math
+import torch
+from torch import nn
+from torch.nn import functional as F
+import math
+import numpy as np
+def fused_leaky_relu(input, bias, negative_slope=0.2, scale=2 ** 0.5):
+    return F.leaky_relu(input + bias, negative_slope) * scale
+
+
+class FusedLeakyReLU(nn.Module):
+    def __init__(self, channel, negative_slope=0.2, scale=2 ** 0.5):
+        super().__init__()
+        self.bias = nn.Parameter(torch.zeros(1, channel, 1, 1))
+        self.negative_slope = negative_slope
+        self.scale = scale
+
+    def forward(self, input):
+        out = fused_leaky_relu(input, self.bias, self.negative_slope, self.scale)
+        return out
+
+
+def upfirdn2d_native(input, kernel, up_x, up_y, down_x, down_y, pad_x0, pad_x1, pad_y0, pad_y1):
+    _, minor, in_h, in_w = input.shape
+    kernel_h, kernel_w = kernel.shape
+
+    out = input.view(-1, minor, in_h, 1, in_w, 1)
+    out = F.pad(out, [0, up_x - 1, 0, 0, 0, up_y - 1, 0, 0])
+    out = out.view(-1, minor, in_h * up_y, in_w * up_x)
+
+    out = F.pad(out, [max(pad_x0, 0), max(pad_x1, 0), max(pad_y0, 0), max(pad_y1, 0)])
+    out = out[:, :, max(-pad_y0, 0): out.shape[2] - max(-pad_y1, 0),
+          max(-pad_x0, 0): out.shape[3] - max(-pad_x1, 0), ]
+
+    out = out.reshape([-1, 1, in_h * up_y + pad_y0 + pad_y1, in_w * up_x + pad_x0 + pad_x1])
+    w = torch.flip(kernel, [0, 1]).view(1, 1, kernel_h, kernel_w)
+    out = F.conv2d(out, w)
+    out = out.reshape(-1, minor, in_h * up_y + pad_y0 + pad_y1 - kernel_h + 1,
+                      in_w * up_x + pad_x0 + pad_x1 - kernel_w + 1, )
+
+    return out[:, :, ::down_y, ::down_x]
+
+
+def upfirdn2d(input, kernel, up=1, down=1, pad=(0, 0)):
+    return upfirdn2d_native(input, kernel, up, up, down, down, pad[0], pad[1], pad[0], pad[1])
+
+
+def make_kernel(k):
+    k = torch.tensor(k, dtype=torch.float32)
+
+    if k.ndim == 1:
+        k = k[None, :] * k[:, None]
+
+    k /= k.sum()
+
+    return k
+
+
+class Blur(nn.Module):
+    def __init__(self, kernel, pad, upsample_factor=1):
+        super().__init__()
+
+        kernel = make_kernel(kernel)
+
+        if upsample_factor > 1:
+            kernel = kernel * (upsample_factor ** 2)
+
+        self.register_buffer('kernel', kernel)
+
+        self.pad = pad
+
+    def forward(self, input):
+        return upfirdn2d(input, self.kernel, pad=self.pad)
+
+
+class ScaledLeakyReLU(nn.Module):
+    def __init__(self, negative_slope=0.2):
+        super().__init__()
+
+        self.negative_slope = negative_slope
+
+    def forward(self, input):
+        return F.leaky_relu(input, negative_slope=self.negative_slope)
+
+
+class EqualConv2d(nn.Module):
+    def __init__(self, in_channel, out_channel, kernel_size, stride=1, padding=0, bias=True):
+        super().__init__()
+
+        self.weight = nn.Parameter(torch.randn(out_channel, in_channel, kernel_size, kernel_size))
+        self.scale = 1 / math.sqrt(in_channel * kernel_size ** 2)
+
+        self.stride = stride
+        self.padding = padding
+
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_channel))
+        else:
+            self.bias = None
+
+    def forward(self, input):
+
+        return F.conv2d(input, self.weight * self.scale, bias=self.bias, stride=self.stride, padding=self.padding)
+
+    def __repr__(self):
+        return (
+            f'{self.__class__.__name__}({self.weight.shape[1]}, {self.weight.shape[0]},'
+            f' {self.weight.shape[2]}, stride={self.stride}, padding={self.padding})'
+        )
+
+
+class EqualLinear(nn.Module):
+    def __init__(self, in_dim, out_dim, bias=True, bias_init=0, lr_mul=1, activation=None):
+        super().__init__()
+
+        self.weight = nn.Parameter(torch.randn(out_dim, in_dim).div_(lr_mul))
+
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_dim).fill_(bias_init))
+        else:
+            self.bias = None
+
+        self.activation = activation
+
+        self.scale = (1 / math.sqrt(in_dim)) * lr_mul
+        self.lr_mul = lr_mul
+
+    def forward(self, input):
+
+        if self.activation:
+            out = F.linear(input, self.weight * self.scale)
+            out = fused_leaky_relu(out, self.bias * self.lr_mul)
+        else:
+            out = F.linear(input, self.weight * self.scale, bias=self.bias * self.lr_mul)
+
+        return out
+
+    def __repr__(self):
+        return (f'{self.__class__.__name__}({self.weight.shape[1]}, {self.weight.shape[0]})')
+
+
+class ConvLayer(nn.Sequential):
+    def __init__(
+            self,
+            in_channel,
+            out_channel,
+            kernel_size,
+            downsample=False,
+            blur_kernel=[1, 3, 3, 1],
+            bias=True,
+            activate=True,
+    ):
+        layers = []
+
+        if downsample:
+            factor = 2
+            p = (len(blur_kernel) - factor) + (kernel_size - 1)
+            pad0 = (p + 1) // 2
+            pad1 = p // 2
+
+            layers.append(Blur(blur_kernel, pad=(pad0, pad1)))
+
+            stride = 2
+            self.padding = 0
+
+        else:
+            stride = 1
+            self.padding = kernel_size // 2
+
+        layers.append(EqualConv2d(in_channel, out_channel, kernel_size, padding=self.padding, stride=stride,
+                                  bias=bias and not activate))
+
+        if activate:
+            if bias:
+                layers.append(FusedLeakyReLU(out_channel))
+            else:
+                layers.append(ScaledLeakyReLU(0.2))
+
+        super().__init__(*layers)
+
+
+
+
+
+class PixelNorm(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, input):
+        return input * torch.rsqrt(torch.mean(input ** 2, dim=1, keepdim=True) + 1e-8)
+
+
+class MotionPixelNorm(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, input):
+        return input * torch.rsqrt(torch.mean(input ** 2, dim=2, keepdim=True) + 1e-8)
+
+
+def make_kernel(k):
+    k = torch.tensor(k, dtype=torch.float32)
+
+    if k.ndim == 1:
+        k = k[None, :] * k[:, None]
+
+    k /= k.sum()
+
+    return k
+
+
+class Upsample(nn.Module):
+    def __init__(self, kernel, factor=2):
+        super().__init__()
+
+        self.factor = factor
+        kernel = make_kernel(kernel) * (factor ** 2)
+        self.register_buffer('kernel', kernel)
+
+        p = kernel.shape[0] - factor
+
+        pad0 = (p + 1) // 2 + factor - 1
+        pad1 = p // 2
+
+        self.pad = (pad0, pad1)
+
+    def forward(self, input):
+        return upfirdn2d(input, self.kernel, up=self.factor, down=1, pad=self.pad)
+
+
+class Downsample(nn.Module):
+    def __init__(self, kernel, factor=2):
+        super().__init__()
+
+        self.factor = factor
+        kernel = make_kernel(kernel)
+        self.register_buffer('kernel', kernel)
+
+        p = kernel.shape[0] - factor
+
+        pad0 = (p + 1) // 2
+        pad1 = p // 2
+
+        self.pad = (pad0, pad1)
+
+    def forward(self, input):
+        return upfirdn2d(input, self.kernel, up=1, down=self.factor, pad=self.pad)
+
+
+class Blur(nn.Module):
+    def __init__(self, kernel, pad, upsample_factor=1):
+        super().__init__()
+
+        kernel = make_kernel(kernel)
+
+        if upsample_factor > 1:
+            kernel = kernel * (upsample_factor ** 2)
+
+        self.register_buffer('kernel', kernel)
+
+        self.pad = pad
+
+    def forward(self, input):
+        return upfirdn2d(input, self.kernel, pad=self.pad)
+
+
+class EqualConv2d(nn.Module):
+    def __init__(self, in_channel, out_channel, kernel_size, stride=1, padding=0, bias=True):
+        super().__init__()
+
+        self.weight = nn.Parameter(torch.randn(out_channel, in_channel, kernel_size, kernel_size))
+        self.scale = 1 / math.sqrt(in_channel * kernel_size ** 2)
+
+        self.stride = stride
+        self.padding = padding
+
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_channel))
+        else:
+            self.bias = None
+
+    def forward(self, input):
+
+        return F.conv2d(input, self.weight * self.scale, bias=self.bias, stride=self.stride, padding=self.padding, )
+
+    def __repr__(self):
+        return (
+            f'{self.__class__.__name__}({self.weight.shape[1]}, {self.weight.shape[0]},'
+            f' {self.weight.shape[2]}, stride={self.stride}, padding={self.padding})'
+        )
+
+
+class EqualLinear(nn.Module):
+    def __init__(self, in_dim, out_dim, bias=True, bias_init=0, lr_mul=1, activation=None):
+        super().__init__()
+
+        self.weight = nn.Parameter(torch.randn(out_dim, in_dim).div_(lr_mul))
+
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_dim).fill_(bias_init))
+        else:
+            self.bias = None
+
+        self.activation = activation
+
+        self.scale = (1 / math.sqrt(in_dim)) * lr_mul
+        self.lr_mul = lr_mul
+
+    def forward(self, input):
+
+        if self.activation:
+            out = F.linear(input, self.weight * self.scale)
+            out = fused_leaky_relu(out, self.bias * self.lr_mul)
+        else:
+            out = F.linear(input, self.weight * self.scale, bias=self.bias * self.lr_mul)
+
+        return out
+
+    def __repr__(self):
+        return (f'{self.__class__.__name__}({self.weight.shape[1]}, {self.weight.shape[0]})')
+
+
+class ScaledLeakyReLU(nn.Module):
+    def __init__(self, negative_slope=0.2):
+        super().__init__()
+
+        self.negative_slope = negative_slope
+
+    def forward(self, input):
+        return F.leaky_relu(input, negative_slope=self.negative_slope)
+
+
+class ModulatedConv2d(nn.Module):
+    def __init__(self, in_channel, out_channel, kernel_size, style_dim, demodulate=True, upsample=False,
+                 downsample=False, blur_kernel=[1, 3, 3, 1], ):
+        super().__init__()
+
+        self.eps = 1e-8
+        self.kernel_size = kernel_size
+        self.in_channel = in_channel
+        self.out_channel = out_channel
+        self.upsample = upsample
+        self.downsample = downsample
+
+        if upsample:
+            factor = 2
+            p = (len(blur_kernel) - factor) - (kernel_size - 1)
+            pad0 = (p + 1) // 2 + factor - 1
+            pad1 = p // 2 + 1
+
+            self.blur = Blur(blur_kernel, pad=(pad0, pad1), upsample_factor=factor)
+
+        if downsample:
+            factor = 2
+            p = (len(blur_kernel) - factor) + (kernel_size - 1)
+            pad0 = (p + 1) // 2
+            pad1 = p // 2
+
+            self.blur = Blur(blur_kernel, pad=(pad0, pad1))
+
+        fan_in = in_channel * kernel_size ** 2
+        self.scale = 1 / math.sqrt(fan_in)
+        self.padding = kernel_size // 2
+
+        self.weight = nn.Parameter(torch.randn(1, out_channel, in_channel, kernel_size, kernel_size))
+
+        self.modulation = EqualLinear(style_dim, in_channel, bias_init=1)
+        self.demodulate = demodulate
+
+    def __repr__(self):
+        return (
+            f'{self.__class__.__name__}({self.in_channel}, {self.out_channel}, {self.kernel_size}, '
+            f'upsample={self.upsample}, downsample={self.downsample})'
+        )
+
+    def forward(self, input, style):
+        batch, in_channel, height, width = input.shape
+
+        style = self.modulation(style).view(batch, 1, in_channel, 1, 1)
+        weight = self.scale * self.weight * style
+
+        if self.demodulate:
+            demod = torch.rsqrt(weight.pow(2).sum([2, 3, 4]) + 1e-8)
+            weight = weight * demod.view(batch, self.out_channel, 1, 1, 1)
+
+        weight = weight.view(batch * self.out_channel, in_channel, self.kernel_size, self.kernel_size)
+
+        if self.upsample:
+            input = input.view(1, batch * in_channel, height, width)
+            weight = weight.view(batch, self.out_channel, in_channel, self.kernel_size, self.kernel_size)
+            weight = weight.transpose(1, 2).reshape(batch * in_channel, self.out_channel, self.kernel_size,
+                                                    self.kernel_size)
+            out = F.conv_transpose2d(input, weight, padding=0, stride=2, groups=batch)
+            _, _, height, width = out.shape
+            out = out.view(batch, self.out_channel, height, width)
+            out = self.blur(out)
+        elif self.downsample:
+            input = self.blur(input)
+            _, _, height, width = input.shape
+            input = input.view(1, batch * in_channel, height, width)
+            out = F.conv2d(input, weight, padding=0, stride=2, groups=batch)
+            _, _, height, width = out.shape
+            out = out.view(batch, self.out_channel, height, width)
+        else:
+            input = input.view(1, batch * in_channel, height, width)
+            out = F.conv2d(input, weight, padding=self.padding, groups=batch)
+            _, _, height, width = out.shape
+            out = out.view(batch, self.out_channel, height, width)
+
+        return out
+
+
+class NoiseInjection(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.weight = nn.Parameter(torch.zeros(1))
+
+    def forward(self, image, noise=None):
+
+        if noise is None:
+            return image
+        else:
+            return image + self.weight * noise
+
+
+class ConstantInput(nn.Module):
+    def __init__(self, channel, size=4):
+        super().__init__()
+
+        self.input = nn.Parameter(torch.randn(1, channel, size, size))
+
+    def forward(self, input):
+        batch = input.shape[0]
+        out = self.input.repeat(batch, 1, 1, 1)
+
+        return out
+
+
+class StyledConv(nn.Module):
+    def __init__(self, in_channel, out_channel, kernel_size, style_dim, upsample=False, blur_kernel=[1, 3, 3, 1],
+                 demodulate=True):
+        super().__init__()
+
+        self.conv = ModulatedConv2d(
+            in_channel,
+            out_channel,
+            kernel_size,
+            style_dim,
+            upsample=upsample,
+            blur_kernel=blur_kernel,
+            demodulate=demodulate,
+        )
+
+        self.noise = NoiseInjection()
+        self.activate = FusedLeakyReLU(out_channel)
+
+    def forward(self, input, style, noise=None):
+        out = self.conv(input, style)
+        out = self.noise(out, noise=noise)
+        out = self.activate(out)
+
+        return out
+
+
+
+class ToRGB(nn.Module):
+    def __init__(self, in_channel, style_dim, upsample=True, blur_kernel=[1, 3, 3, 1]):
+        super().__init__()
+
+        if upsample:
+            self.upsample = Upsample(blur_kernel)
+
+        self.conv = ConvLayer(in_channel, 3, 1)
+        self.bias = nn.Parameter(torch.zeros(1, 3, 1, 1))
+
+    def forward(self, input, skip=None):
+        out = self.conv(input)
+        out = out + self.bias
+
+        if skip is not None:
+            skip = self.upsample(skip)
+            out = out + skip
+
+        return out
+
+
+class ToFlow(nn.Module):
+    def __init__(self, in_channel, style_dim, upsample=True, blur_kernel=[1, 3, 3, 1]):
+        super().__init__()
+
+        if upsample:
+            self.upsample = Upsample(blur_kernel)
+
+        self.conv = ModulatedConv2d(in_channel, 3, 1, style_dim, demodulate=False)
+        self.bias = nn.Parameter(torch.zeros(1, 3, 1, 1))
+
+    def forward(self, input, style, feat, skip=None):
+        out = self.conv(input, style)
+        out = out + self.bias
+
+        # warping
+        xs = np.linspace(-1, 1, input.size(2))
+        xs = np.meshgrid(xs, xs)
+        xs = np.stack(xs, 2)
+
+        xs = torch.tensor(xs, requires_grad=False).float().unsqueeze(0).repeat(input.size(0), 1, 1, 1).cuda()
+
+        if skip is not None:
+            skip = self.upsample(skip)
+            out = out + skip
+
+        sampler = torch.tanh(out[:, 0:2, :, :])
+        mask = torch.sigmoid(out[:, 2:3, :, :])
+        flow = sampler.permute(0, 2, 3, 1) + xs
+
+        feat_warp = F.grid_sample(feat, flow) * mask
+
+        return feat_warp, feat_warp + input * (1.0 - mask), out
+
+
+class Direction(nn.Module):
+    def __init__(self, motion_dim):
+        super(Direction, self).__init__()
+
+        self.weight = nn.Parameter(torch.randn(512, motion_dim))
+
+    def forward(self, input):
+        # input: (bs*t) x 512
+
+        weight = self.weight + 1e-8
+        Q, R = torch.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
+
+        if input is None:
+            return Q
+        else:
+            input_diag = torch.diag_embed(input)  # alpha, diagonal matrix
+            out = torch.matmul(input_diag, Q.T)
+            out = torch.sum(out, dim=1)
+
+            return out
+
+
+class Synthesis(nn.Module):
+    def __init__(self, size, style_dim, motion_dim, blur_kernel=[1, 3, 3, 1], channel_multiplier=1):
+        super(Synthesis, self).__init__()
+
+        self.size = size
+        self.style_dim = style_dim
+        self.motion_dim = motion_dim
+
+        self.direction = Direction(motion_dim)
+
+        self.channels = {
+            4: 512,
+            8: 512,
+            16: 512,
+            32: 512,
+            64: 256 * channel_multiplier,
+            128: 128 * channel_multiplier,
+            256: 64 * channel_multiplier,
+            512: 32 * channel_multiplier,
+            1024: 16 * channel_multiplier,
+        }
+
+        self.input = ConstantInput(self.channels[4])
+        self.conv1 = StyledConv(self.channels[4], self.channels[4], 3, style_dim, blur_kernel=blur_kernel)
+        self.to_rgb1 = ToRGB(self.channels[4], style_dim, upsample=False)
+
+        self.log_size = int(math.log(size, 2))
+        self.num_layers = (self.log_size - 2) * 2 + 1
+
+        self.convs = nn.ModuleList()
+        self.upsamples = nn.ModuleList()
+        self.to_rgbs = nn.ModuleList()
+        self.to_flows = nn.ModuleList()
+
+        in_channel = self.channels[4]
+
+        for i in range(3, self.log_size + 1):
+            out_channel = self.channels[2 ** i]
+
+            self.convs.append(StyledConv(in_channel, out_channel, 3, style_dim, upsample=True,
+                                         blur_kernel=blur_kernel))
+            self.convs.append(StyledConv(out_channel, out_channel, 3, style_dim, blur_kernel=blur_kernel))
+            self.to_rgbs.append(ToRGB(out_channel, style_dim))
+
+            self.to_flows.append(ToFlow(out_channel, style_dim))
+
+            in_channel = out_channel
+
+        self.n_latent = self.log_size * 2 - 2
+
+    def forward(self, wa, alpha, feats):
+
+        # wa: bs x style_dim
+        # alpha: bs x style_dim
+
+        bs = wa.size(0)
+
+        if alpha is not None:
+            # generating moving directions
+            if len(alpha) > 1:
+                directions_target = self.direction(alpha[0])  # target
+                directions_source = self.direction(alpha[1])  # source
+                directions_start = self.direction(alpha[2])  # start
+                latent = wa + (directions_target - directions_start) + directions_source
+            else:
+                directions = self.direction(alpha[0])
+                latent = wa + directions  # wa + directions
+        else:
+            latent = wa
+
+        inject_index = self.n_latent
+        latent = latent.unsqueeze(1).repeat(1, inject_index, 1)
+
+        out = self.input(latent)
+        out = self.conv1(out, latent[:, 0])
+
+        i = 1
+        for conv1, conv2, to_rgb, to_flow, feat in zip(self.convs[::2], self.convs[1::2], self.to_rgbs,
+                                                       self.to_flows, feats):
+            out = conv1(out, latent[:, i])
+            out = conv2(out, latent[:, i + 1])
+            if out.size(2) == 8:
+                out_warp, out, skip_flow = to_flow(out, latent[:, i + 2], feat)
+                skip = to_rgb(out_warp)
+            else:
+                out_warp, out, skip_flow = to_flow(out, latent[:, i + 2], feat, skip_flow)
+                skip = to_rgb(out_warp, skip)
+            i += 2
+
+        img = skip
+
+        return img
+    

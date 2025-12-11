@@ -77,19 +77,43 @@ def export_onnx(
     input_names: list,
     output_names: list,
     dynamic_axes: dict = None,
-    opset_version: int = 18,
+    opset_version: int = 17,
+    use_dynamo: bool = True,
 ):
     """Export a module to ONNX format."""
-    torch.onnx.export(
-        module,
-        dummy_inputs,
-        output_path,
-        input_names=input_names,
-        output_names=output_names,
-        dynamic_axes=dynamic_axes,
-        opset_version=opset_version,
-        do_constant_folding=True,
-    )
+    if use_dynamo:
+        # Try new dynamo-based exporter
+        torch.onnx.export(
+            module,
+            dummy_inputs,
+            output_path,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            opset_version=opset_version,
+            do_constant_folding=True,
+        )
+    else:
+        # Force legacy TorchScript-based exporter by disabling dynamo
+        import torch._dynamo
+        torch._dynamo.config.suppress_errors = True
+
+        # Trace the model first
+        with torch.no_grad():
+            traced = torch.jit.trace(module, dummy_inputs)
+
+        torch.onnx.export(
+            traced,
+            dummy_inputs,
+            output_path,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            opset_version=opset_version,
+            do_constant_folding=True,
+            export_params=True,
+            verbose=False,
+        )
     size_mb = os.path.getsize(output_path) / 1e6
     print(f"  Exported: {output_path} ({size_mb:.2f} MB)")
     return True
@@ -278,7 +302,7 @@ def export_dense_feature_encoder(model, output_dir: str, device: str, format: st
             print(f"  TorchScript export failed: {e}")
 
 
-def export_full_renderer(model, output_dir: str, device: str, format: str = 'onnx'):
+def export_full_renderer(model, output_dir: str, device: str, format: str = 'onnx', use_dynamo: bool = True):
     """Export the full renderer as a single model."""
     print("\n[4/4] Exporting full renderer...")
 
@@ -317,6 +341,7 @@ def export_full_renderer(model, output_dir: str, device: str, format: str = 'onn
                     'output': {0: 'batch'},
                     'motion_latent': {0: 'batch'},
                 },
+                use_dynamo=use_dynamo,
             )
         except Exception as e:
             print(f"  ONNX export failed: {e}")
@@ -424,6 +449,11 @@ Examples:
         default=['all'],
         help='Which components to export'
     )
+    parser.add_argument(
+        '--legacy',
+        action='store_true',
+        help='Use legacy TorchScript-based ONNX exporter instead of dynamo'
+    )
 
     args = parser.parse_args()
 
@@ -471,7 +501,8 @@ Examples:
         export_dense_feature_encoder(model, args.output, args.device, args.format)
 
     if 'full' in components:
-        export_full_renderer(model, args.output, args.device, args.format)
+        use_dynamo = not args.legacy
+        export_full_renderer(model, args.output, args.device, args.format, use_dynamo=use_dynamo)
 
     # Verify
     if not args.skip_verify:

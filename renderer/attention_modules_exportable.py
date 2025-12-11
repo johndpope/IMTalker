@@ -141,98 +141,94 @@ class ExportFriendlyUpsampler(nn.Module):
     """
     Export-friendly replacement for GuidedResampler.
 
-    Instead of using dynamic top-k selection and sparse indexing,
-    we use learnable upsampling followed by cross-attention.
+    The original GuidedResampler uses dynamic top-k selection with modulo operations
+    (topk_indices % W_low) which ONNX cannot export. This replacement uses:
 
-    The key insight is that GuidedResampler essentially:
-    1. Uses coarse attention map to guide selection from high-res features
-    2. Warps/resamples high-res features based on coarse attention
+    1. Bilinear upsampling of coarse attention map to guide high-res features
+    2. Learned convolutional refinement (no attention at high-res!)
+    3. All operations are fully static and ONNX-exportable
 
-    Our replacement:
-    1. Upsample low-res features to high-res using ConvTranspose2d
-    2. Apply cross-attention between upsampled features and high-res features
-    3. This achieves similar "guided" behavior but is fully exportable
+    Key insight: The coarse attention map already captures spatial relationships.
+    We can upsample it and use it as soft weights without dynamic indexing.
     """
 
     def __init__(
         self,
         dim: int,
         upsample_ratio: int = 4,
-        num_heads: int = 8,
+        num_heads: int = 8,  # kept for API compatibility, not used
     ):
         super().__init__()
         self.dim = dim
         self.ratio = upsample_ratio
-        self.num_heads = num_heads
 
-        # Learnable upsampler
-        self.upsample = nn.Sequential(
-            nn.ConvTranspose2d(dim, dim, kernel_size=upsample_ratio, stride=upsample_ratio),
+        # Learnable refinement after attention-guided upsampling
+        # This replaces the sparse sampling with learned local processing
+        self.refine = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=min(dim, 32)),
             nn.GELU(),
             nn.Conv2d(dim, dim, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(dim, dim, kernel_size=1),
         )
 
-        # Cross-attention to blend with high-res features
-        self.cross_attn = ExportFriendlyMultiheadAttention(
-            dim=dim,
-            num_heads=num_heads,
-            qkv_bias=True,
-            attn_drop=0.0,
-            proj_drop=0.0,
+        # Attention map processing - converts attention weights to spatial guidance
+        # Input: [B, N_low, N_low] -> Output: [B, 1, H_low, W_low]
+        self.attn_proj = nn.Sequential(
+            nn.Linear(1, dim // 4),
+            nn.GELU(),
+            nn.Linear(dim // 4, 1),
+            nn.Sigmoid(),
         )
-
-        # Layer norms
-        self.norm_q = nn.LayerNorm(dim)
-        self.norm_kv = nn.LayerNorm(dim)
-
-        # Output projection
-        self.out_proj = nn.Conv2d(dim, dim, kernel_size=1)
 
     def forward(
         self,
         v_high_feat: torch.Tensor,
-        coarse_attn_map: torch.Tensor,
+        coarse_attn_map: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Args:
             v_high_feat: High resolution features [B, C, H, W]
             coarse_attn_map: Attention map from coarse level [B, N_low, N_low]
-                            (Note: We don't actually use this for dynamic indexing,
-                             but keep the signature for compatibility)
+                            Used to guide upsampling. If None, uses uniform weights.
 
         Returns:
-            warped_feat: Warped high-res features [B, C, H, W]
+            warped_feat: Refined high-res features [B, C, H, W]
         """
         B, C, H, W = v_high_feat.shape
-        H_low, W_low = H // self.ratio, W // self.ratio
 
-        # Create low-res query from attention map (learnable projection)
-        # We interpret the attention map as a soft selection over spatial locations
-        # Shape: [B, N_low, N_low] -> [B, C, H_low, W_low]
+        if coarse_attn_map is not None:
+            # Extract diagonal of attention (self-attention weights) as spatial importance
+            # Shape: [B, N_low, N_low] -> take diagonal -> [B, N_low]
+            N_low = coarse_attn_map.shape[1]
+            H_low = W_low = int(N_low ** 0.5)
 
-        # Use the attention map to weight the high-res features at coarse level
-        # First, pool high-res to low-res
-        v_low = F.adaptive_avg_pool2d(v_high_feat, (H_low, W_low))
+            # Sum attention received by each position as importance score
+            attn_importance = coarse_attn_map.sum(dim=-1)  # [B, N_low]
+            attn_importance = attn_importance.view(B, 1, H_low, W_low)  # [B, 1, H_low, W_low]
 
-        # Upsample to high resolution
-        v_upsampled = self.upsample(v_low)  # [B, C, H, W]
+            # Upsample attention importance to high-res using bilinear interpolation
+            # This is fully static - no dynamic indexing!
+            attn_upsampled = F.interpolate(
+                attn_importance,
+                size=(H, W),
+                mode='bilinear',
+                align_corners=False
+            )  # [B, 1, H, W]
 
-        # Flatten for attention
-        q = v_upsampled.flatten(2).transpose(1, 2)  # [B, H*W, C]
-        kv = v_high_feat.flatten(2).transpose(1, 2)  # [B, H*W, C]
+            # Normalize to [0, 1] range for soft gating
+            attn_upsampled = torch.sigmoid(attn_upsampled - attn_upsampled.mean())
 
-        # Normalize
-        q = self.norm_q(q)
-        kv = self.norm_kv(kv)
+            # Apply attention-guided weighting
+            guided_feat = v_high_feat * (1.0 + attn_upsampled)
+        else:
+            guided_feat = v_high_feat
 
-        # Cross-attention: upsampled queries attending to high-res key/values
-        out, _ = self.cross_attn(q, kv, kv)
+        # Apply learned local refinement
+        out = self.refine(guided_feat)
 
-        # Reshape back to spatial
-        out = out.transpose(1, 2).view(B, C, H, W)
-
-        # Final projection
-        out = self.out_proj(out)
+        # Residual connection
+        out = out + v_high_feat
 
         return out
 
@@ -302,6 +298,8 @@ class ExportFriendlySwinAttention(nn.Module):
         key: torch.Tensor,
         value: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
+        batch_size: Optional[int] = None,
+        num_windows: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -309,6 +307,8 @@ class ExportFriendlySwinAttention(nn.Module):
             key: [B*num_windows, window_size*window_size, C]
             value: [B*num_windows, window_size*window_size, C]
             mask: Optional shift mask [num_windows, ws*ws, ws*ws]
+            batch_size: Explicit batch size to avoid dynamic computation
+            num_windows: Explicit number of windows to avoid dynamic computation
 
         Returns:
             output: [B*num_windows, window_size*window_size, C]
@@ -328,9 +328,17 @@ class ExportFriendlySwinAttention(nn.Module):
 
         # Apply shift mask if provided
         if mask is not None:
-            nW = mask.shape[0]
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
+            # Use explicitly passed values to avoid dynamic shape computation
+            if num_windows is None:
+                nW = mask.shape[0]
+            else:
+                nW = num_windows
+            if batch_size is None:
+                B = B_ // nW
+            else:
+                B = batch_size
+            attn = attn.view(B, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(B * nW, self.num_heads, N, N)
 
         attn = F.softmax(attn, dim=-1)
         attn = self.attn_drop(attn)
@@ -430,6 +438,68 @@ def window_reverse_static(
     x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
     return x
+
+
+class StaticWindowPartition(nn.Module):
+    """
+    Static window partition as a module with pre-computed dimensions.
+    This avoids dynamic shape computations during ONNX export.
+    """
+
+    def __init__(self, H: int, W: int, window_size: int):
+        super().__init__()
+        self.H = H
+        self.W = W
+        self.window_size = window_size
+        self.num_h = H // window_size
+        self.num_w = W // window_size
+        self.num_windows = self.num_h * self.num_w
+        self.window_area = window_size * window_size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, H, W, C]
+        Returns:
+            windows: [B*num_windows, window_size*window_size, C]
+        """
+        B = x.shape[0]
+        C = x.shape[3]
+        # Use pre-computed constants
+        x = x.view(B, self.num_h, self.window_size, self.num_w, self.window_size, C)
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+        windows = x.view(B * self.num_windows, self.window_area, C)
+        return windows
+
+
+class StaticWindowReverse(nn.Module):
+    """
+    Static window reverse as a module with pre-computed dimensions.
+    This avoids dynamic shape computations during ONNX export.
+    """
+
+    def __init__(self, H: int, W: int, window_size: int):
+        super().__init__()
+        self.H = H
+        self.W = W
+        self.window_size = window_size
+        self.num_h = H // window_size
+        self.num_w = W // window_size
+        self.num_windows = self.num_h * self.num_w
+
+    def forward(self, windows: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """
+        Args:
+            windows: [B*num_windows, window_size*window_size, C]
+            batch_size: The batch size B (passed explicitly to avoid dynamic computation)
+        Returns:
+            x: [B, H, W, C]
+        """
+        C = windows.shape[2]
+        x = windows.view(batch_size, self.num_h, self.num_w, self.window_size, self.window_size, C)
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+        x = x.view(batch_size, self.H, self.W, C)
+        return x
 
 
 class ExportFriendlyTransformerBlock(nn.Module):
@@ -567,7 +637,8 @@ class ExportFriendlySwinBlock(nn.Module):
     """
     Export-friendly Swin Transformer block.
 
-    Drop-in replacement for UnifiedSwinBlock with static window operations.
+    Drop-in replacement for UnifiedSwinBlock with FULLY STATIC window operations.
+    All dimensions are pre-computed at init time to avoid dynamic shape inference.
     """
 
     def __init__(
@@ -593,6 +664,10 @@ class ExportFriendlySwinBlock(nn.Module):
             self.shift_size = 0
             self.window_size = min(H, W)
 
+        # Store as Python ints for static computation
+        self.H = H
+        self.W = W
+
         self.norm_q = nn.LayerNorm(dim)
         self.norm_kv = nn.LayerNorm(dim)
 
@@ -613,6 +688,10 @@ class ExportFriendlySwinBlock(nn.Module):
             nn.Linear(mlp_hidden_dim, dim),
             nn.Dropout(drop),
         )
+
+        # Static window modules with pre-computed dimensions
+        self.window_partition = StaticWindowPartition(H, W, self.window_size)
+        self.window_reverse = StaticWindowReverse(H, W, self.window_size)
 
         # Pre-compute shift mask
         if self.shift_size > 0:
@@ -662,7 +741,11 @@ class ExportFriendlySwinBlock(nn.Module):
         Returns:
             output: [B, C, H, W]
         """
-        B, C, H, W = query.shape
+        # Use static dimensions instead of dynamic shape inference
+        B = query.shape[0]
+        C = self.dim
+        H = self.H
+        W = self.W
 
         if key is None:
             key = query
@@ -674,7 +757,7 @@ class ExportFriendlySwinBlock(nn.Module):
         v = value.flatten(2).transpose(1, 2)
         shortcut = v
 
-        # Normalize and reshape to spatial
+        # Normalize and reshape to spatial (use static H, W)
         q = self.norm_q(q).view(B, H, W, C)
         k = self.norm_kv(k).view(B, H, W, C)
         v = self.norm_kv(v).view(B, H, W, C)
@@ -687,16 +770,21 @@ class ExportFriendlySwinBlock(nn.Module):
         else:
             shifted_q, shifted_k, shifted_v = q, k, v
 
-        # Partition into windows
-        q_win = window_partition_static(shifted_q, self.window_size)
-        k_win = window_partition_static(shifted_k, self.window_size)
-        v_win = window_partition_static(shifted_v, self.window_size)
+        # Partition into windows using static module
+        q_win = self.window_partition(shifted_q)
+        k_win = self.window_partition(shifted_k)
+        v_win = self.window_partition(shifted_v)
 
-        # Windowed attention
-        attn_windows = self.attn(q_win, k_win, v_win, mask=self.attn_mask)
+        # Windowed attention - pass batch_size and num_windows explicitly for static export
+        attn_windows = self.attn(
+            q_win, k_win, v_win,
+            mask=self.attn_mask,
+            batch_size=B,
+            num_windows=self.window_partition.num_windows
+        )
 
-        # Reverse windows
-        shifted_x = window_reverse_static(attn_windows, self.window_size, H, W)
+        # Reverse windows using static module (pass batch size explicitly)
+        shifted_x = self.window_reverse(attn_windows, B)
 
         # Reverse cyclic shift
         if self.shift_size > 0:
@@ -788,6 +876,53 @@ class ExportFriendlyCrossAttention(nn.Module):
                 num_heads=num_heads,
             )
 
+    def coarse_stage(
+        self,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        attn: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Coarse stage attention (standard attention path).
+
+        Args:
+            A: Query features [B, C, H, W]
+            B: Key features [B, C, H, W]
+            C: Value features [B, C, H, W]
+            attn: Unused
+
+        Returns:
+            output: [B, C, H, W]
+            attn_map: [B, num_heads, N, N]
+        """
+        B_, C_, H, W = A.shape
+        A_seq = A.flatten(2).transpose(1, 2)
+        B_seq = B.flatten(2).transpose(1, 2)
+        C_seq = C.flatten(2).transpose(1, 2)
+        out_seq, attn_map = self.block_efc(A_seq, B_seq, C_seq)
+        out = out_seq.transpose(1, 2).view(B_, C_, H, W)
+        return out, attn_map
+
+    def fine_stage(
+        self,
+        C: torch.Tensor,
+        attn: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Fine stage attention (high-res upsampler path).
+
+        Args:
+            C: Value features [B, C, H, W]
+            attn: Attention map from coarse level
+
+        Returns:
+            output: [B, C, H, W]
+        """
+        attn_input = attn.mean(dim=1) if attn is not None else None
+        out = self.block(C, attn_input)
+        return out
+
     def forward(
         self,
         A: torch.Tensor,
@@ -810,18 +945,11 @@ class ExportFriendlyCrossAttention(nn.Module):
         """
         if not self.is_standard_attention:
             # High resolution path - use upsampler
-            out = self.block(C, attn.mean(dim=1) if attn is not None else None)
-            return out, None
+            out = self.fine_stage(C, attn)
+            return out
         else:
             # Standard attention path
-            B_, C_, H, W = A.shape
-            A_seq = A.flatten(2).transpose(1, 2)
-            B_seq = B.flatten(2).transpose(1, 2)
-            C_seq = C.flatten(2).transpose(1, 2)
-
-            out_seq, attn_map = self.block_efc(A_seq, B_seq, C_seq)
-            out = out_seq.transpose(1, 2).view(B_, C_, H, W)
-            return out, attn_map
+            return self.coarse_stage(A, B, C, attn)
 
     @classmethod
     def from_original(
@@ -1025,6 +1153,30 @@ def convert_attention_modules(model: nn.Module, args=None) -> nn.Module:
             setattr(model, name, ExportFriendlySelfAttention.from_original(
                 module, window_size, swin_res_threshold
             ))
+        elif isinstance(module, nn.ModuleList):
+            # Handle ModuleList - convert each element
+            for i, submodule in enumerate(module):
+                if isinstance(submodule, StandardUnifiedAttention):
+                    module[i] = ExportFriendlyMultiheadAttention.from_original(submodule)
+                elif isinstance(submodule, GuidedResampler):
+                    module[i] = ExportFriendlyUpsampler.from_original(submodule, num_heads)
+                elif isinstance(submodule, SwinUnifiedAttention):
+                    module[i] = ExportFriendlySwinAttention.from_original(submodule)
+                elif isinstance(submodule, UnifiedTransformerBlock):
+                    module[i] = ExportFriendlyTransformerBlock.from_original(submodule)
+                elif isinstance(submodule, UnifiedSwinBlock):
+                    module[i] = ExportFriendlySwinBlock.from_original(submodule)
+                elif isinstance(submodule, CrossAttention):
+                    module[i] = ExportFriendlyCrossAttention.from_original(
+                        submodule, num_heads, swin_res_threshold
+                    )
+                elif isinstance(submodule, SelfAttention):
+                    module[i] = ExportFriendlySelfAttention.from_original(
+                        submodule, window_size, swin_res_threshold
+                    )
+                else:
+                    # Recursively convert children of this submodule
+                    convert_attention_modules(submodule, args)
         else:
             # Recursively convert children
             convert_attention_modules(module, args)
