@@ -512,7 +512,7 @@ def convert_styled_conv(module: nn.Module) -> nn.Module:
     return module
 
 
-def convert_to_exportable(model: nn.Module) -> nn.Module:
+def convert_to_exportable(model: nn.Module, convert_attention: bool = False, args=None) -> nn.Module:
     """
     Convert a model to use export-friendly blocks.
 
@@ -521,11 +521,20 @@ def convert_to_exportable(model: nn.Module) -> nn.Module:
     - EqualConv2d -> ExportableEqualConv2d
     - StyledConv -> ExportableStyledConv
 
+    And optionally (with convert_attention=True):
+    - StandardUnifiedAttention -> ExportFriendlyMultiheadAttention
+    - GuidedResampler -> ExportFriendlyUpsampler
+    - SwinUnifiedAttention -> ExportFriendlySwinAttention
+    - CrossAttention -> ExportFriendlyCrossAttention
+    - SelfAttention -> ExportFriendlySelfAttention
+
     The converted model should produce numerically equivalent outputs
     and be exportable to ONNX/TF.js.
 
     Args:
         model: Original model (e.g., IMTRenderer)
+        convert_attention: Whether to also convert attention modules
+        args: Optional args namespace with num_heads, window_size, swin_res_threshold
 
     Returns:
         Converted model with export-friendly blocks
@@ -537,6 +546,11 @@ def convert_to_exportable(model: nn.Module) -> nn.Module:
     model = convert_styled_conv(model)
     model = convert_equal_conv(model)
     model = convert_equal_linear(model)
+
+    # Optionally convert attention modules
+    if convert_attention:
+        from renderer.attention_modules_exportable import convert_attention_modules
+        model = convert_attention_modules(model, args)
 
     return model
 

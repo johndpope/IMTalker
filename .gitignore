@@ -3,3 +3,4 @@
 /__pycache__
 /generator/__pycache__
 /renderer/__pycache__
+exports/*
