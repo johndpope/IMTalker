@@ -224,19 +224,33 @@ class ExportableModulatedConv2d(nn.Module):
         self.downsample = downsample
         self.padding = kernel_size // 2
 
-        # Scale factor (same as original)
+        # Scale factor - will be baked into weights
         fan_in = in_channel * kernel_size ** 2
-        self.scale = 1 / math.sqrt(fan_in)
+        self.register_buffer('scale', torch.tensor(1 / math.sqrt(fan_in)))
 
         # Style modulation: maps style_dim -> in_channel (for input modulation)
         self.modulation = ExportableEqualLinear(style_dim, in_channel, bias=True)
 
-        # Main convolution weight (without the leading batch dimension)
+        # Main convolution weight - stored PRE-SCALED for ONNX compatibility
+        # During from_original(), we multiply by scale so forward() uses static weights
         self.weight = nn.Parameter(torch.randn(out_channel, in_channel, kernel_size, kernel_size))
 
-        # For demodulation, we need weight norm per output channel
-        # This is precomputed as: sqrt(sum(weight^2, dims=[in_ch, k, k]))
-        # We'll compute it dynamically but it's a simple reduction
+        # For upsample: pre-transposed weight to avoid runtime transpose
+        # This is set during from_original() or bake_weights()
+        if upsample:
+            self.weight_t = nn.Parameter(torch.randn(in_channel, out_channel, kernel_size, kernel_size))
+        else:
+            self.weight_t = None
+
+        # Pre-computed weight squared sum for demodulation (set during bake_weights)
+        # This avoids runtime ReduceSum which onnx2tf can't convert properly
+        if demodulate:
+            self.register_buffer('w_sq_per_ch', torch.zeros(out_channel, in_channel))
+        else:
+            self.w_sq_per_ch = None
+
+        # Track if weights have been baked (scale applied)
+        self._weights_baked = False
 
         # Blur for up/downsampling
         if upsample:
@@ -253,13 +267,39 @@ class ExportableModulatedConv2d(nn.Module):
             pad1 = p // 2
             self.blur = ExportableBlur(blur_kernel, pad=(pad0, pad1))
 
+    def bake_weights(self):
+        """
+        Bake scale into weights for ONNX export compatibility.
+        This makes weights static tensors instead of runtime-computed.
+        Also pre-computes w_sq_per_ch to eliminate runtime ReduceSum.
+        """
+        if self._weights_baked:
+            return
+
+        with torch.no_grad():
+            # Apply scale to weight
+            self.weight.mul_(self.scale.item())
+
+            # For upsample, create pre-transposed weight
+            if self.upsample and self.weight_t is not None:
+                self.weight_t.copy_(self.weight.transpose(0, 1).contiguous())
+
+            # Pre-compute weight squared sum for demodulation
+            # This eliminates runtime ReduceSum which onnx2tf can't handle
+            if self.demodulate and self.w_sq_per_ch is not None:
+                # [out_ch, in_ch, k, k] -> sum over spatial dims -> [out_ch, in_ch]
+                self.w_sq_per_ch.copy_((self.weight ** 2).sum(dim=[2, 3]))
+
+        self._weights_baked = True
+
     def forward(self, x: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
         """
         Forward pass using feature modulation instead of weight modulation.
 
-        For ONNX compatibility, we avoid grouped convolutions with groups=batch.
-        Instead, we process each sample through the same convolution but with
-        per-sample feature scaling (modulation) and output scaling (demodulation).
+        For ONNX/TF.js compatibility:
+        - Weights are PRE-SCALED (scale baked in during from_original)
+        - For upsample, we use PRE-TRANSPOSED weights (weight_t)
+        - No runtime weight computation = static graph = clean export
 
         Args:
             x: Input features [B, in_channel, H, W]
@@ -268,7 +308,8 @@ class ExportableModulatedConv2d(nn.Module):
         Returns:
             out: Modulated output [B, out_channel, H', W']
         """
-        batch, in_channel, height, width = x.shape
+        # Note: We avoid extracting batch dimension (x.shape[0]) to prevent
+        # ONNX Shape ops which onnx2tf can't handle properly
 
         # Get modulation factors: [B, in_channel]
         style_mod = self.modulation(style)  # [B, in_channel]
@@ -276,10 +317,15 @@ class ExportableModulatedConv2d(nn.Module):
         # === FEATURE MODULATION (replaces weight modulation) ===
         # Modulate input features by style
         # x_mod[b, c, h, w] = x[b, c, h, w] * style_mod[b, c]
-        x_mod = x * style_mod.view(batch, in_channel, 1, 1)
+        # Use unsqueeze instead of view(batch, ...) to avoid Shape ops
+        x_mod = x * style_mod.unsqueeze(-1).unsqueeze(-1)  # [B, in_ch, 1, 1]
 
-        # Scale weights (this was done at runtime in original)
-        weight = self.weight * self.scale  # [out_ch, in_ch, k, k]
+        # Use pre-baked weights (scale already applied)
+        # If not baked yet (e.g., fresh init), apply scale at runtime
+        if self._weights_baked:
+            weight = self.weight  # Already scaled
+        else:
+            weight = self.weight * self.scale  # Runtime scaling (for training)
 
         # === DEMODULATION FACTOR ===
         if self.demodulate:
@@ -287,8 +333,13 @@ class ExportableModulatedConv2d(nn.Module):
             # Since we modulated x instead of w, we compute:
             # demod = 1 / sqrt(sum_ic(w_oc_ic^2 * s_ic^2)) per output channel
 
-            # Expand weight squared: [out_ch, in_ch]
-            w_sq_per_ch = (weight ** 2).sum(dim=[2, 3])  # [out_ch, in_ch]
+            # Use pre-computed weight squared sum (baked during export)
+            # This avoids runtime ReduceSum which onnx2tf can't convert
+            if self._weights_baked and self.w_sq_per_ch is not None:
+                w_sq_per_ch = self.w_sq_per_ch  # [out_ch, in_ch] - static buffer
+            else:
+                # Runtime computation (for training/non-baked inference)
+                w_sq_per_ch = (weight ** 2).sum(dim=[2, 3])  # [out_ch, in_ch]
 
             # Style squared: [B, in_channel]
             s_sq = style_mod ** 2
@@ -299,16 +350,11 @@ class ExportableModulatedConv2d(nn.Module):
 
         # === CONVOLUTION ===
         if self.upsample:
-            # For upsample: use standard conv_transpose2d
-            # The original used groups=batch which isn't exportable
-            # We achieve the same result by:
-            # 1. Feature modulation (already done above)
-            # 2. Standard transpose conv
-            # 3. Per-sample output scaling (demodulation)
-
-            # Transpose conv weight should be [in_ch, out_ch, k, k] for conv_transpose2d
-            # Original weight is [out_ch, in_ch, k, k]
-            weight_t = weight.transpose(0, 1).contiguous()  # [in_ch, out_ch, k, k]
+            # Use pre-transposed weight for ONNX compatibility
+            if self._weights_baked and self.weight_t is not None:
+                weight_t = self.weight_t  # Pre-transposed, static
+            else:
+                weight_t = weight.transpose(0, 1).contiguous()  # Runtime transpose
 
             out = F.conv_transpose2d(x_mod, weight_t, padding=0, stride=2)
             out = self.blur(out)
@@ -322,7 +368,8 @@ class ExportableModulatedConv2d(nn.Module):
 
         # Apply demodulation (per-sample output scaling)
         if self.demodulate:
-            out = out * demod.view(batch, self.out_channel, 1, 1)
+            # Use unsqueeze instead of view(batch, ...) to avoid Shape ops
+            out = out * demod.unsqueeze(-1).unsqueeze(-1)  # [B, out_ch, 1, 1]
 
         return out
 
@@ -330,6 +377,9 @@ class ExportableModulatedConv2d(nn.Module):
     def from_original(cls, original_module) -> 'ExportableModulatedConv2d':
         """
         Create from original ModulatedConv2d, transferring weights.
+
+        IMPORTANT: This method also BAKES the scale into weights for ONNX export.
+        After conversion, weights are pre-scaled and (for upsample) pre-transposed.
         """
         new_module = cls(
             in_channel=original_module.in_channel,
@@ -351,21 +401,43 @@ class ExportableModulatedConv2d(nn.Module):
             # Transfer modulation layer
             new_module.modulation = ExportableEqualLinear.from_original(original_module.modulation)
 
-            # Transfer blur if present
-            if original_module.upsample or original_module.downsample:
-                new_module.blur.kernel.copy_(original_module.blur.kernel)
+            # Note: blur kernels don't need explicit transfer - they're computed from
+            # the same [1,3,3,1] specification in both original and exportable.
+            # The ExportableBlur constructs its diagonal kernels automatically.
+
+            # BAKE weights for ONNX export (scale applied, transpose pre-computed)
+            new_module.bake_weights()
 
         return new_module
 
 
 class ExportableBlur(nn.Module):
     """
-    Export-friendly blur using standard conv2d.
+    Export-friendly blur using explicit per-channel convolution.
+
+    WHY THIS APPROACH:
+    ------------------
+    Previous approaches failed because:
+    1. Depthwise conv (groups=channels) - onnx2tf can't transpose [C,1,kH,kW] weights
+    2. Unfold+matmul - legacy ONNX exporter doesn't support Unfold with dynamic sizes
+    3. Reshape to [B*C, 1, H, W] - requires dynamic batch*channels computation
+
+    SOLUTION - EXPAND KERNEL TO FULL CONV:
+    --------------------------------------
+    We pre-expand the blur kernel to a full [C, C, kH, kW] weight tensor where:
+    - It's diagonal: channel i only reads from channel i
+    - Each diagonal has the same blur kernel
+
+    This is mathematically equivalent to depthwise conv but uses a standard
+    conv weight format that both ONNX legacy exporter and onnx2tf can handle.
+
+    Trade-off: Larger weight tensor (C*C*kH*kW instead of C*kH*kW), but
+    this is acceptable for the blur kernel sizes (4x4) we use.
     """
-    def __init__(self, kernel: list, pad: tuple, upsample_factor: int = 1):
+    def __init__(self, kernel: list, pad: tuple, upsample_factor: int = 1, max_channels: int = 512):
         super().__init__()
 
-        # Create blur kernel
+        # Create blur kernel (same as before)
         k = torch.tensor(kernel, dtype=torch.float32)
         if k.ndim == 1:
             k = k[None, :] * k[:, None]
@@ -374,25 +446,52 @@ class ExportableBlur(nn.Module):
         if upsample_factor > 1:
             k = k * (upsample_factor ** 2)
 
-        self.register_buffer('kernel', k)
         self.pad = pad
+        self.kernel_size = k.shape[0]
+
+        # Store the base kernel for reference
+        self.register_buffer('base_kernel', k)
+
+        # Pre-build expanded kernels for common channel counts
+        # This avoids runtime expansion which causes ONNX issues
+        for c in [128, 256, 512]:
+            expanded = self._build_diagonal_kernel(k, c)
+            self.register_buffer(f'kernel_{c}', expanded)
+
+    def _build_diagonal_kernel(self, k: torch.Tensor, channels: int) -> torch.Tensor:
+        """
+        Build a diagonal convolution kernel [C, C, kH, kW] where each
+        output channel only depends on the same input channel.
+        """
+        kh, kw = k.shape
+        # Create [C, C, kH, kW] with k on the diagonal
+        weight = torch.zeros(channels, channels, kh, kw)
+        for i in range(channels):
+            weight[i, i] = k
+        return weight
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply blur using depthwise conv."""
-        kernel = self.kernel
-        kernel_h, kernel_w = kernel.shape
-
-        # Upfirdn2d implementation using standard ops
+        """
+        Apply blur using pre-expanded diagonal kernel.
+        """
         batch, channels, height, width = x.shape
 
-        # Pad
-        x = F.pad(x, [self.pad[0], self.pad[1], self.pad[0], self.pad[1]])
+        # Pad input
+        x_padded = F.pad(x, [self.pad[0], self.pad[1], self.pad[0], self.pad[1]])
 
-        # Apply blur per channel (depthwise)
-        # Reshape kernel for depthwise conv: [channels, 1, kh, kw]
-        kernel_expanded = kernel.view(1, 1, kernel_h, kernel_w).expand(channels, 1, kernel_h, kernel_w)
+        # Get the appropriate pre-built kernel
+        if channels == 512:
+            kernel = self.kernel_512
+        elif channels == 256:
+            kernel = self.kernel_256
+        elif channels == 128:
+            kernel = self.kernel_128
+        else:
+            # Fallback: build kernel at runtime (not ideal for export)
+            kernel = self._build_diagonal_kernel(self.base_kernel, channels).to(x.device)
 
-        out = F.conv2d(x, kernel_expanded, groups=channels)
+        # Apply standard conv2d with diagonal kernel
+        out = F.conv2d(x_padded, kernel, padding=0)
 
         return out
 

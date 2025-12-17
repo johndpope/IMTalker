@@ -698,7 +698,7 @@ class IMTRenderer(nn.Module):
         for dim, s_dim in zip(self.feature_dims[::-1], self.spatial_dims[::-1]):
             self.imt.append(CrossAttention(args=args, dim=dim, resolution=(s_dim, s_dim)))
 
-    def decode(self, A, B, C):
+    def decode(self, ma_c, ma_r, f_r):
         """
         Implicit Motion Transfer via hierarchical cross-attention.
 
@@ -707,16 +707,16 @@ class IMTRenderer(nn.Module):
         and sample identity features at corresponding positions.
 
         Args:
-            A: Current motion maps (ma_c) - "where we want features" (Query)
-            B: Reference motion maps (ma_r) - "where features are" (Key)
-            C: Reference identity features (f_r) - "what features look like" (Value)
+            ma_c: Current motion maps - "where we want features" (Query)
+            ma_r: Reference motion maps - "where features are" (Key)
+            f_r: Reference identity features - "what features look like" (Value)
 
         Returns:
             output_frame: Rendered frame [B, 3, H, W]
 
         Attention Mechanism:
             aligned = softmax(Q·K^T / √d) · V
-            Where Q from A (current motion), K from B (ref motion), V from C (identity)
+            Where Q from ma_c, K from ma_r, V from f_r
 
         Coarse-to-Fine Strategy:
             - Coarse levels: Compute full attention, save attention map
@@ -734,16 +734,16 @@ class IMTRenderer(nn.Module):
                 # COARSE STAGE: Full cross-attention
                 # Computes attention map from motion features
                 aligned_feature, attention_map = attention_block.coarse_stage(
-                    A[i],  # Query: current motion
-                    B[i],  # Key: reference motion
-                    C[i]   # Value: identity features
+                    ma_c[i],  # Query: current motion
+                    ma_r[i],  # Key: reference motion
+                    f_r[i]    # Value: identity features
                 )
                 aligned_features[i] = aligned_feature
             else:
                 # FINE STAGE: Guided sparse resampling
                 # Uses upsampled coarse attention map (no Q·K computation!)
                 aligned_feature = attention_block.fine_stage(
-                    C[i],           # Value: identity features
+                    f_r[i],             # Value: identity features
                     attn=attention_map  # Reuse coarse attention
                 )
                 aligned_features[i] = aligned_feature
@@ -758,10 +758,10 @@ class IMTRenderer(nn.Module):
 
         Returns:
             f_r: Multi-scale dense features for rendering
-            id: Global identity embedding [B, 512] for IA module
+            i_r: Global identity embedding [B, 512] for IA module
         """
-        f_r, id = self.dense_feature_encoder(x)
-        return f_r, id
+        f_r, i_r = self.dense_feature_encoder(x)
+        return f_r, i_r
 
     def mot_encode(self, x):
         """
@@ -787,18 +787,18 @@ class IMTRenderer(nn.Module):
         mot_map = self.latent_token_decoder(x)
         return mot_map
 
-    def id_adapt(self, t, id):
+    def id_adapt(self, t, i_r):
         """
         Adapt motion latent to specific identity.
 
         Args:
             t: Generic motion latent [B, 32]
-            id: Identity embedding [B, 512]
+            i_r: Identity embedding [B, 512]
 
         Returns:
-            t_adapted: Personalized motion latent [B, 32]
+            ta: Personalized motion latent [B, 32]
         """
-        return self.adapt(t, id)
+        return self.adapt(t, i_r)
 
     def forward(self, x_current, x_reference):
         """
