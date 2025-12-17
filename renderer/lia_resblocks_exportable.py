@@ -345,18 +345,40 @@ class ExportableModulatedConv2d(nn.Module):
             s_sq = style_mod ** 2
 
             # Compute demod factor: [B, out_ch]
-            demod_sq = torch.einsum('oi,bi->bo', w_sq_per_ch, s_sq) + 1e-8
+            # Use matmul instead of einsum for TF.js compatibility
+            # einsum('oi,bi->bo', w_sq_per_ch, s_sq) = s_sq @ w_sq_per_ch.T
+            demod_sq = torch.matmul(s_sq, w_sq_per_ch.T) + 1e-8  # [B, out_ch]
             demod = torch.rsqrt(demod_sq)  # [B, out_ch]
 
         # === CONVOLUTION ===
         if self.upsample:
-            # Use pre-transposed weight for ONNX compatibility
-            if self._weights_baked and self.weight_t is not None:
-                weight_t = self.weight_t  # Pre-transposed, static
-            else:
-                weight_t = weight.transpose(0, 1).contiguous()  # Runtime transpose
+            # TF.js FIX: Replace ConvTranspose with Upsample + Conv
+            # ConvTranspose causes dimension mismatch in onnx2tf
+            # Upsample (bilinear) + Conv is mathematically similar and fully static
+            #
+            # SIZE MATCHING:
+            # ConvTranspose(H, stride=2, pad=0, k=3) = (H-1)*2 + 3 = 2H+1
+            # Then blur(pad=(1,1), k=4) reduces by 1: 2H+1 -> 2H
+            #
+            # Our approach:
+            # interpolate(H, 2x) = 2H
+            # pad(0,1,0,1) = 2H+1 (match ConvTranspose output)
+            # conv2d(pad=1, k=3) = 2H+1 (same padding preserves size)
+            # blur = 2H+1-1 = 2H (matches original!)
 
-            out = F.conv_transpose2d(x_mod, weight_t, padding=0, stride=2)
+            # First upsample spatially by 2x using bilinear interpolation
+            # Bilinear is smoother than nearest and produces better visual quality
+            out = F.interpolate(x_mod, scale_factor=2, mode='bilinear', align_corners=False)
+
+            # Add 1 pixel on right and bottom to match ConvTranspose output size
+            # This is crucial for size parity with the original implementation
+            out = F.pad(out, [0, 1, 0, 1], mode='replicate')
+
+            # Then apply convolution with standard (not transposed) weight
+            # Note: weight is flipped during from_original() to mimic ConvTranspose behavior
+            out = F.conv2d(out, weight, padding=self.padding)
+
+            # Apply blur for anti-aliasing (same as original)
             out = self.blur(out)
 
         elif self.downsample:
@@ -396,6 +418,13 @@ class ExportableModulatedConv2d(nn.Module):
             orig_weight = original_module.weight
             if orig_weight.dim() == 5:
                 orig_weight = orig_weight.squeeze(0)
+
+            # For upsample path: flip weights to mimic ConvTranspose behavior
+            # ConvTranspose internally flips the kernel during computation,
+            # so flipping here helps align with original learned patterns
+            if original_module.upsample:
+                orig_weight = orig_weight.flip(2, 3)
+
             new_module.weight.copy_(orig_weight)
 
             # Transfer modulation layer
