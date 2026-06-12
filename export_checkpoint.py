@@ -36,7 +36,10 @@ def get_default_args():
         attention_heads=8,
         attention_dropout=0.0,
         num_heads=8,
-        swin_res_threshold=32,
+        # Must match training/inference config (app.py, renderer/inference.py).
+        # 32 builds Swin blocks the checkpoint never trained — they then run
+        # with random weights and load_state_dict(strict=False) hides it.
+        swin_res_threshold=128,
         window_size=8,
     )
 
@@ -49,7 +52,18 @@ def load_model(checkpoint_path: str, device: str = 'cpu'):
     model = IMTRenderer(args)
 
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt['state_dict'], strict=False)
+    state_dict = ckpt.get('state_dict', ckpt)
+    # Checkpoint keys are prefixed with "gen." (Lightning module attribute);
+    # without stripping it, strict=False silently loads ZERO weights.
+    clean = {k.replace('gen.', '', 1): v for k, v in state_dict.items() if k.startswith('gen.')}
+    if not clean:
+        clean = state_dict
+    missing, unexpected = model.load_state_dict(clean, strict=False)
+    matched = len(clean) - len(unexpected)
+    print(f"  Loaded {matched}/{len(dict(model.named_parameters())) + len(dict(model.named_buffers()))} "
+          f"tensors (missing={len(missing)}, unexpected={len(unexpected)})")
+    if matched == 0:
+        raise RuntimeError("No checkpoint weights matched the model — refusing to export random weights")
     model.eval()
     model = model.to(device)
 
@@ -95,8 +109,10 @@ def export_onnx(
         )
     else:
         # Force legacy TorchScript-based exporter by disabling dynamo
-        import torch._dynamo
-        torch._dynamo.config.suppress_errors = True
+        # NOTE: must not use `import torch._dynamo` here — it would bind `torch`
+        # as a function-local and break the dynamo branch above (UnboundLocalError)
+        from torch import _dynamo
+        _dynamo.config.suppress_errors = True
 
         # Trace the model first
         with torch.no_grad():
@@ -331,16 +347,14 @@ def export_full_renderer(model, output_dir: str, device: str, format: str = 'onn
     if format in ['onnx', 'all']:
         path = os.path.join(output_dir, 'full_renderer.onnx')
         try:
+            # Static batch=1 on purpose: the attention/window-partition code bakes
+            # shape ints during tracing, and declaring dynamic batch makes the
+            # exporter misgeneralize reshapes — the graph silently produces wrong
+            # values (~22dB PSNR vs PyTorch). Verified exact without dynamic_axes.
             export_onnx(
                 full_renderer, (dummy_driving, dummy_reference), path,
                 input_names=['driving_image', 'reference_image'],
                 output_names=['output', 'motion_latent'],
-                dynamic_axes={
-                    'driving_image': {0: 'batch'},
-                    'reference_image': {0: 'batch'},
-                    'output': {0: 'batch'},
-                    'motion_latent': {0: 'batch'},
-                },
                 use_dynamo=use_dynamo,
             )
         except Exception as e:
